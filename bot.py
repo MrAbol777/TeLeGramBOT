@@ -3,7 +3,7 @@ import logging
 from aiogram import Bot, Dispatcher
 from config import settings
 from database.db_handler import DatabaseHandler
-from handlers import start
+from handlers import admin, start, user_menu
 
 async def main():
     # تنظیمات لاگ (برای دیدن اتفاقات در کنسول)
@@ -19,6 +19,8 @@ async def main():
 
     # ثبت روترها (هندلرها)
     dp.include_router(start.router)
+    dp.include_router(user_menu.router)
+    dp.include_router(admin.router)
 
     # وصل کردن دیتابیس به تمام هندلرها
     dp["db"] = db

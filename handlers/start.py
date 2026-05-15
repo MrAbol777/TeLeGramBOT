@@ -34,8 +34,7 @@ async def start_handler(message: Message, db: DatabaseHandler) -> None:
     user_id = message.from_user.id
 
     try:
-        if not await db.user_exists(user_id):
-            await db.add_user(user_id)
+        await db.add_user_if_not_exists(user_id)
     except Exception:
         logger.exception("Database operation failed in /start for user_id=%s", user_id)
         await message.answer("خطایی در ثبت اطلاعات رخ داد. لطفاً دوباره تلاش کنید.")

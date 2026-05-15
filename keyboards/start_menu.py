@@ -28,7 +28,7 @@ def build_start_menu() -> InlineKeyboardMarkup:
         ),
         InlineKeyboardButton(
             text="شارژ حساب",
-            callback_data="recharge",
+            callback_data="recharge_wallet",
             custom_emoji_id="5868268899480375540",
         ),
     )
