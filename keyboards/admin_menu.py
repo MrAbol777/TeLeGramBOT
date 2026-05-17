@@ -6,6 +6,12 @@ def build_admin_menu() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text="➕ افزودن کانفیگ")],
             [KeyboardButton(text="📊 آمار موجودی")],
+            [KeyboardButton(text="📊 آمار کلی")],
+            [KeyboardButton(text="📈 گزارش فروش")],
+            [KeyboardButton(text="📢 ارسال همگانی")],
+            [KeyboardButton(text="💳 تنظیم شماره کارت")],
+            [KeyboardButton(text="➕ افزودن کانفیگ جدید")],
+            [KeyboardButton(text="💰 مدیریت قیمت‌ها")],
             [KeyboardButton(text="🔙 بازگشت به منوی اصلی")],
         ],
         resize_keyboard=True,

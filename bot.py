@@ -12,6 +12,10 @@ async def main():
     # راه اندازی دیتابیس
     db = DatabaseHandler("database.db")
     await db.initialize()
+    # مقدار اولیه شماره کارت را یک بار از env داخل دیتابیس ثبت می‌کنیم.
+    current_card = await db.get_setting("admin_card_number")
+    if not current_card:
+        await db.set_setting("admin_card_number", settings.ADMIN_CARD_NUMBER)
 
     # راه اندازی ربات
     bot = Bot(token=settings.BOT_TOKEN)

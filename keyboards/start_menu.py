@@ -7,29 +7,31 @@ def build_start_menu() -> InlineKeyboardMarkup:
 
     builder.add(
         InlineKeyboardButton(
-            text="خرید سرویس",
+            text="🛍 خرید سرویس",
             callback_data="buy_service",
             custom_emoji_id="5829966475623928907",
         ),
         InlineKeyboardButton(
-            text="حساب کاربری",
+            text="👤 حساب کاربری",
             callback_data="user_profile",
             custom_emoji_id="5372926953978341366",
         ),
         InlineKeyboardButton(
-            text="ثبت تیکت",
-            callback_data="open_ticket",
-            custom_emoji_id="5893480314558222431",
+            text="📚 راهنمای اتصال",
+            callback_data="connection_guide",
         ),
         InlineKeyboardButton(
-            text="ارتباط با پشتیبانی",
+            text="👨‍💻 پشتیبانی",
             callback_data="support",
-            custom_emoji_id="5875178591326573705",
         ),
         InlineKeyboardButton(
-            text="شارژ حساب",
+            text="💳 شارژ حساب",
             callback_data="recharge_wallet",
             custom_emoji_id="5868268899480375540",
+        ),
+        InlineKeyboardButton(
+            text="📂 سرویس‌های من",
+            callback_data="my_services",
         ),
     )
     builder.adjust(2)
