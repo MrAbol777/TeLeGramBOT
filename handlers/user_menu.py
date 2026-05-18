@@ -22,6 +22,17 @@ logger = logging.getLogger(__name__)
 
 router = Router(name="user_menu")
 
+PROFILE_MESSAGE = """
+<tg-emoji emoji-id='5190458330719461749'>🧑‍💻</tg-emoji>
+<b>پنل کاربری شما</b>
+
+<tg-emoji emoji-id='5809707982472090166'>🆔</tg-emoji> • شناسه عددی: {user_id}
+
+<tg-emoji emoji-id='5373052667671093676'>🛍</tg-emoji> • تعداد کل خریدها: {purchases_count}
+
+<tg-emoji emoji-id='5958399943533138158'>💰</tg-emoji> • موجودی کیف پول: {balance} تومان
+""".strip()
+
 
 def build_receipt_review_keyboard(user_id: int) -> InlineKeyboardBuilder:
     builder = InlineKeyboardBuilder()
@@ -90,11 +101,12 @@ async def user_profile_handler(
     profile_builder.adjust(1)
 
     await callback.message.answer(
-        f"👤 پروفایل شما\n"
-        f"🆔 شناسه عددی: `{user_id}`\n"
-        f"🛍 تعداد کل خریدها: `{purchases_count}`\n"
-        f"💰 موجودی کیف پول: `{balance:,}` تومان".replace(",", "٬"),
-        parse_mode="Markdown",
+        text=PROFILE_MESSAGE.format(
+            user_id=user_id,
+            purchases_count=purchases_count,
+            balance=f"{balance:,}".replace(",", "٬"),
+        ),
+        parse_mode="HTML",
         reply_markup=profile_builder.as_markup(),
     )
 
