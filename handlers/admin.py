@@ -147,6 +147,44 @@ def build_edit_config_keyboard(config_id: int) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
+def build_sales_report_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="🔄 بروزرسانی", callback_data="refresh_sales_report"),
+        InlineKeyboardButton(text="⬅️ بازگشت", callback_data="admin_back:main_admin_menu"),
+    )
+    return builder.as_markup()
+
+
+async def _send_sales_report(message: Message, db: DatabaseHandler) -> None:
+    today_sales = await db.get_today_sales_count()
+    today_amount = await db.get_today_sales_amount()
+    total_amount = await db.get_total_sales_amount()
+    latest = await db.get_latest_sales(5)
+
+    lines = [
+        "📊 گزارش فروش",
+        "",
+        f"📅 فروش امروز: {today_sales}",
+        f"💰 درآمد امروز: {today_amount:,} تومان".replace(",", "٬"),
+        f"💎 کل درآمد: {total_amount:,} تومان".replace(",", "٬"),
+        "",
+        "آخرین خریدها:",
+    ]
+    if latest:
+        numbers = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
+        for idx, (username, model, _title, price, _purchased_at) in enumerate(latest):
+            model_text = "Nox Plus" if model == "nox_plus" else "Nox Multi" if model == "nox_multi" else model
+            username_text = f"@{username}" if username else "بدون‌نام"
+            lines.append(
+                f"{numbers[idx]} {username_text} | {model_text} | {price:,}".replace(",", "٬")
+            )
+    else:
+        lines.append("موردی ثبت نشده است.")
+
+    await message.answer("\n".join(lines), reply_markup=build_sales_report_keyboard())
+
+
 async def _send_admin_edit_config(message: Message, db: DatabaseHandler, config_id: int) -> None:
     config = await db.get_config_for_admin_edit(config_id)
     if not config:
@@ -428,6 +466,35 @@ async def sales_report_handler(message: Message, db: DatabaseHandler) -> None:
         parse_mode="HTML",
         reply_markup=build_admin_menu(),
     )
+
+
+@router.message(F.text == "📊 گزارش فروش")
+async def sales_report_from_sales_table_handler(message: Message, db: DatabaseHandler) -> None:
+    try:
+        await _send_sales_report(message, db)
+    except Exception:
+        logger.exception("Loading sales report from sales table failed")
+        await message.answer("❌ دریافت گزارش فروش با خطا مواجه شد.")
+
+
+@router.callback_query(F.data == "admin_sales_report")
+async def admin_sales_report_callback_handler(callback: CallbackQuery, db: DatabaseHandler) -> None:
+    await callback.answer()
+    try:
+        await _send_sales_report(callback.message, db)
+    except Exception:
+        logger.exception("Loading sales report callback failed")
+        await callback.message.answer("❌ دریافت گزارش فروش با خطا مواجه شد.")
+
+
+@router.callback_query(F.data == "refresh_sales_report")
+async def refresh_sales_report_callback_handler(callback: CallbackQuery, db: DatabaseHandler) -> None:
+    await callback.answer("بروزرسانی شد")
+    try:
+        await _send_sales_report(callback.message, db)
+    except Exception:
+        logger.exception("Refreshing sales report failed")
+        await callback.message.answer("❌ بروزرسانی گزارش فروش با خطا مواجه شد.")
 
 
 @router.message(F.text == "📊 آمار کلی")
@@ -1031,7 +1098,9 @@ async def admin_edit_field_value_handler(message: Message, state: FSMContext, db
     if not updated:
         await message.answer("⚠️ بروزرسانی انجام نشد.")
         return
-    await message.answer("✅ مقدار با موفقیت بروزرسانی شد.", reply_markup=build_admin_menu())
+    # Keep admin in the same edit context for a smoother UX after field updates.
+    await message.answer("✅ مقدار با موفقیت بروزرسانی شد.")
+    await _send_admin_edit_config(message, db, int(config_id))
 
 
 @router.callback_query(F.data.startswith("admin_delete_config:"))

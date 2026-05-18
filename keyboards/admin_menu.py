@@ -8,6 +8,7 @@ def build_admin_menu() -> ReplyKeyboardMarkup:
             [KeyboardButton(text="📊 آمار موجودی")],
             [KeyboardButton(text="📊 آمار کلی")],
             [KeyboardButton(text="📈 گزارش فروش")],
+            [KeyboardButton(text="📊 گزارش فروش")],
             [KeyboardButton(text="📢 ارسال همگانی")],
             [KeyboardButton(text="💳 تنظیم شماره کارت")],
             [KeyboardButton(text="➕ افزودن کانفیگ جدید")],

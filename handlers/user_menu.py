@@ -309,11 +309,13 @@ async def buy_config_handler(callback: CallbackQuery, db: DatabaseHandler) -> No
 
     _, title, price, duration, description, _config_content = config
     await callback.message.answer(
-        f"📦 {title}\n\n"
-        f"💰 قیمت: {price:,}\n"
-        f"⏳ مدت: {duration}\n\n"
-        "📝 توضیحات:\n"
-        f"{description}".replace(",", "٬"),
+        "📦 Service Details\n\n"
+        f"Title: {title}\n\n"
+        f"Price: {price:,} تومان\n\n"
+        f"Duration: {duration}\n\n"
+        "Description:\n"
+        f"{description}\n\n"
+        "آیا مایل به خرید این سرویس هستید؟".replace(",", "٬"),
         reply_markup=build_model_purchase_confirmation_menu(config_id),
     )
 
@@ -455,6 +457,72 @@ async def confirm_purchase_handler(
         await callback.message.answer("⚠️ خرید انجام شد، اما ارسال نتیجه با خطا مواجه شد.")
 
 
+@router.callback_query(F.data.startswith("confirm_buy:"))
+async def confirm_buy_handler(callback: CallbackQuery, db: DatabaseHandler) -> None:
+    await callback.answer()
+    if callback.from_user is None:
+        return
+    if callback.data is None:
+        return
+    parts = callback.data.split(":")
+    if len(parts) != 2 or not parts[1].isdigit():
+        await callback.message.answer("⚠️ درخواست خرید نامعتبر است.")
+        return
+
+    user_id = callback.from_user.id
+    config_id = int(parts[1])
+
+    try:
+        snapshot = await db.get_model_config_purchase_snapshot(config_id)
+    except Exception:
+        logger.exception("Loading config snapshot failed for config_id=%s", config_id)
+        await callback.message.answer("❌ بررسی وضعیت سرویس با خطا مواجه شد.")
+        return
+
+    if snapshot is None:
+        await callback.message.answer("⚠️ این سرویس دیگر موجود نیست.")
+        return
+
+    _id, title, price, _duration, _description, _content, stock, is_active, is_sold = snapshot
+    if is_active != 1:
+        await callback.message.answer("این سرویس در حال حاضر غیرفعال است.")
+        return
+    if stock == 0 or is_sold == 1:
+        await callback.message.answer("موجودی این سرویس به پایان رسیده است.")
+        return
+
+    try:
+        purchase_completed, config_content = await db.complete_model_purchase(user_id, config_id)
+    except Exception:
+        logger.exception("Completing model purchase failed for user_id=%s config_id=%s", user_id, config_id)
+        await callback.message.answer("❌ انجام خرید با خطا مواجه شد. دوباره تلاش کنید.")
+        return
+
+    if not purchase_completed or not config_content:
+        await callback.message.answer("⚠️ خرید انجام نشد؛ لطفاً دوباره تلاش کنید.")
+        return
+
+    try:
+        config_details = await db.get_config_for_admin_edit(config_id)
+        model = config_details[1] if config_details else ""
+        await db.log_sale(
+            user_id=user_id,
+            username=callback.from_user.username,
+            config_id=config_id,
+            model=model,
+            title=title,
+            price=price,
+        )
+    except Exception:
+        logger.exception("Sale logging failed for user_id=%s config_id=%s", user_id, config_id)
+
+    await callback.message.answer(
+        "✅ خرید با موفقیت انجام شد\n\n"
+        "📦 سرویس شما:\n\n"
+        f"{config_content}",
+    )
+
+
 @router.callback_query(F.data == "cancel_purchase_flow")
 async def cancel_purchase_flow_handler(callback: CallbackQuery) -> None:
     await callback.answer()
@@ -464,6 +532,12 @@ async def cancel_purchase_flow_handler(callback: CallbackQuery) -> None:
 @router.callback_query(F.data == "noop")
 async def noop_handler(callback: CallbackQuery) -> None:
     await callback.answer()
+
+
+@router.callback_query(F.data == "cancel_buy")
+async def cancel_buy_handler(callback: CallbackQuery) -> None:
+    await callback.answer()
+    await callback.message.answer("❌ فرآیند خرید لغو شد.")
 
 
 @router.callback_query(F.data == "my_services")

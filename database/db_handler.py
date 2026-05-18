@@ -57,6 +57,20 @@ class DatabaseHandler:
             )
             await db.execute(
                 """
+                CREATE TABLE IF NOT EXISTS sales (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    username TEXT,
+                    config_id INTEGER,
+                    model TEXT,
+                    title TEXT,
+                    price INTEGER,
+                    purchased_at TEXT DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            await db.execute(
+                """
                 CREATE INDEX IF NOT EXISTS idx_transactions_user_time
                 ON transactions(user_id, timestamp)
                 """
@@ -520,13 +534,79 @@ class DatabaseHandler:
             await db.commit()
             return inserted_count
 
+    async def log_sale(
+        self,
+        user_id: int,
+        username: str | None,
+        config_id: int,
+        model: str,
+        title: str,
+        price: int,
+    ) -> None:
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """
+                INSERT INTO sales (user_id, username, config_id, model, title, price)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (user_id, username, config_id, model, title, price),
+            )
+            await db.commit()
+
+    async def get_total_sales_amount(self) -> int:
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                "SELECT COALESCE(SUM(price), 0) FROM sales"
+            ) as cursor:
+                row = await cursor.fetchone()
+                return int(row[0]) if row else 0
+
+    async def get_today_sales_count(self) -> int:
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                "SELECT COUNT(*) FROM sales WHERE date(purchased_at) = date('now')"
+            ) as cursor:
+                row = await cursor.fetchone()
+                return int(row[0]) if row else 0
+
+    async def get_today_sales_amount(self) -> int:
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                "SELECT COALESCE(SUM(price), 0) FROM sales WHERE date(purchased_at) = date('now')"
+            ) as cursor:
+                row = await cursor.fetchone()
+                return int(row[0]) if row else 0
+
+    async def get_latest_sales(self, limit: int = 10) -> list[tuple[str | None, str, str, int, str]]:
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                """
+                SELECT username, model, title, price, purchased_at
+                FROM sales
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+                return [
+                    (
+                        str(row[0]) if row[0] is not None else None,
+                        str(row[1] or ""),
+                        str(row[2] or ""),
+                        int(row[3] or 0),
+                        str(row[4] or ""),
+                    )
+                    for row in rows
+                ]
+
     async def count_active_configs_by_model(self, model: str) -> int:
         async with aiosqlite.connect(self.db_path) as db:
             async with db.execute(
                 """
                 SELECT COUNT(*)
                 FROM configs
-                WHERE model = ? AND is_active = 1 AND is_sold = 0
+                WHERE model = ? AND is_active = 1 AND is_sold = 0 AND (stock = -1 OR stock > 0)
                 """,
                 (model,),
             ) as cursor:
@@ -544,7 +624,7 @@ class DatabaseHandler:
                 """
                 SELECT id, title, price, duration
                 FROM configs
-                WHERE model = ? AND is_active = 1 AND is_sold = 0
+                WHERE model = ? AND is_active = 1 AND is_sold = 0 AND (stock = -1 OR stock > 0)
                 ORDER BY id
                 LIMIT ? OFFSET ?
                 """,
@@ -584,7 +664,7 @@ class DatabaseHandler:
 
                 async with db.execute(
                     """
-                    SELECT price, config_content, is_sold, is_active
+                    SELECT price, config_content, is_sold, is_active, stock
                     FROM configs
                     WHERE id = ?
                     LIMIT 1
@@ -601,8 +681,12 @@ class DatabaseHandler:
                 config_content = str(config_row[1])
                 is_sold = int(config_row[2] or 0)
                 is_active = int(config_row[3] or 0)
+                stock = int(config_row[4] if config_row[4] is not None else 0)
 
                 if is_sold == 1 or is_active != 1:
+                    await db.rollback()
+                    return False, None
+                if stock == 0:
                     await db.rollback()
                     return False, None
 
@@ -617,7 +701,15 @@ class DatabaseHandler:
                 update_cursor = await db.execute(
                     """
                     UPDATE configs
-                    SET is_sold = 1, sold_to = ?, sold_at = datetime('now')
+                    SET
+                        is_sold = 1,
+                        sold_to = ?,
+                        sold_at = datetime('now'),
+                        stock = CASE
+                            WHEN stock = -1 THEN -1
+                            WHEN stock > 0 THEN stock - 1
+                            ELSE 0
+                        END
                     WHERE id = ? AND is_sold = 0 AND is_active = 1
                     """,
                     (user_id, config_id),
@@ -639,6 +731,35 @@ class DatabaseHandler:
             except Exception:
                 await db.rollback()
                 raise
+
+    async def get_model_config_purchase_snapshot(
+        self,
+        config_id: int,
+    ) -> tuple[int, str, int, str, str, str, int, int, int] | None:
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                """
+                SELECT id, title, price, duration, description, config_content, stock, is_active, is_sold
+                FROM configs
+                WHERE id = ?
+                LIMIT 1
+                """,
+                (config_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+                if not row:
+                    return None
+                return (
+                    int(row[0]),
+                    str(row[1] or ""),
+                    int(row[2] or 0),
+                    str(row[3] or "نامشخص"),
+                    str(row[4] or ""),
+                    str(row[5] or ""),
+                    int(row[6] if row[6] is not None else 0),
+                    int(row[7] or 0),
+                    int(row[8] or 0),
+                )
 
     async def count_admin_configs(self, model: str) -> int:
         async with aiosqlite.connect(self.db_path) as db:
