@@ -19,3 +19,9 @@ class AdminStates(StatesGroup):
     waiting_for_card_number = State()
     waiting_for_add_config_category = State()
     waiting_for_config_list = State()
+
+
+class AdminServiceStates(StatesGroup):
+    adding_config_field = State()
+    editing_config_field = State()
+    confirming_delete = State()

@@ -73,9 +73,83 @@ class DatabaseHandler:
             except aiosqlite.OperationalError:
                 pass
             try:
+                await db.execute("ALTER TABLE configs ADD COLUMN model TEXT")
+            except aiosqlite.OperationalError:
+                pass
+            try:
+                await db.execute("ALTER TABLE configs ADD COLUMN title TEXT")
+            except aiosqlite.OperationalError:
+                pass
+            try:
+                await db.execute("ALTER TABLE configs ADD COLUMN price INTEGER DEFAULT 0")
+            except aiosqlite.OperationalError:
+                pass
+            try:
+                await db.execute("ALTER TABLE configs ADD COLUMN duration TEXT DEFAULT 'نامشخص'")
+            except aiosqlite.OperationalError:
+                pass
+            try:
+                await db.execute("ALTER TABLE configs ADD COLUMN description TEXT DEFAULT ''")
+            except aiosqlite.OperationalError:
+                pass
+            try:
+                await db.execute("ALTER TABLE configs ADD COLUMN stock INTEGER DEFAULT 1")
+            except aiosqlite.OperationalError:
+                pass
+            try:
+                await db.execute("ALTER TABLE configs ADD COLUMN is_active INTEGER DEFAULT 1")
+            except aiosqlite.OperationalError:
+                pass
+            try:
+                await db.execute("ALTER TABLE configs ADD COLUMN created_at TEXT")
+            except aiosqlite.OperationalError:
+                pass
+            try:
                 await db.execute("ALTER TABLE users ADD COLUMN referred_by INTEGER")
             except aiosqlite.OperationalError:
                 pass
+
+            await db.execute(
+                """
+                UPDATE configs
+                SET
+                    title = COALESCE(NULLIF(TRIM(title), ''), category, 'Config #' || id),
+                    price = COALESCE(price, 0),
+                    duration = COALESCE(NULLIF(TRIM(duration), ''), 'نامشخص'),
+                    description = COALESCE(description, ''),
+                    stock = CASE
+                        WHEN stock IS NULL AND is_sold = 0 THEN 1
+                        WHEN stock IS NULL THEN 0
+                        ELSE stock
+                    END,
+                    is_active = COALESCE(is_active, 1),
+                    created_at = COALESCE(created_at, datetime('now'))
+                """
+            )
+            await db.execute(
+                """
+                UPDATE configs
+                SET model = CASE
+                    WHEN model IS NULL OR TRIM(model) = '' THEN
+                        CASE
+                            WHEN lower(COALESCE(category, '')) LIKE '%multi%' THEN 'nox_multi'
+                            ELSE 'nox_plus'
+                        END
+                    ELSE model
+                END
+                """
+            )
+            await db.execute(
+                """
+                UPDATE configs
+                SET price = COALESCE(
+                    (SELECT c.price FROM categories c WHERE c.name = configs.category LIMIT 1),
+                    price,
+                    0
+                )
+                WHERE (price IS NULL OR price = 0)
+                """
+            )
 
             await db.execute(
                 """
@@ -445,3 +519,258 @@ class DatabaseHandler:
                 inserted_count += 1
             await db.commit()
             return inserted_count
+
+    async def count_active_configs_by_model(self, model: str) -> int:
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                """
+                SELECT COUNT(*)
+                FROM configs
+                WHERE model = ? AND is_active = 1 AND is_sold = 0
+                """,
+                (model,),
+            ) as cursor:
+                row = await cursor.fetchone()
+                return int(row[0]) if row else 0
+
+    async def get_active_configs_by_model(
+        self,
+        model: str,
+        limit: int,
+        offset: int,
+    ) -> list[tuple[int, str, int, str]]:
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                """
+                SELECT id, title, price, duration
+                FROM configs
+                WHERE model = ? AND is_active = 1 AND is_sold = 0
+                ORDER BY id
+                LIMIT ? OFFSET ?
+                """,
+                (model, limit, offset),
+            ) as cursor:
+                rows = await cursor.fetchall()
+                return [(int(r[0]), str(r[1]), int(r[2]), str(r[3])) for r in rows]
+
+    async def get_model_config_details(self, config_id: int) -> tuple[int, str, int, str, str, str] | None:
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                """
+                SELECT id, title, price, duration, description, config_content
+                FROM configs
+                WHERE id = ? AND is_active = 1 AND is_sold = 0
+                LIMIT 1
+                """,
+                (config_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+                if not row:
+                    return None
+                return (int(row[0]), str(row[1]), int(row[2]), str(row[3]), str(row[4] or ""), str(row[5]))
+
+    async def complete_model_purchase(self, user_id: int, config_id: int) -> tuple[bool, str | None]:
+        await self.add_user_if_not_exists(user_id)
+        async with aiosqlite.connect(self.db_path) as db:
+            try:
+                await db.execute("BEGIN IMMEDIATE")
+
+                async with db.execute(
+                    "SELECT balance FROM users WHERE user_id = ?",
+                    (user_id,),
+                ) as cursor:
+                    user_row = await cursor.fetchone()
+                balance = int(user_row[0]) if user_row else 0
+
+                async with db.execute(
+                    """
+                    SELECT price, config_content, is_sold, is_active
+                    FROM configs
+                    WHERE id = ?
+                    LIMIT 1
+                    """,
+                    (config_id,),
+                ) as cursor:
+                    config_row = await cursor.fetchone()
+
+                if not config_row:
+                    await db.rollback()
+                    return False, None
+
+                price = int(config_row[0] or 0)
+                config_content = str(config_row[1])
+                is_sold = int(config_row[2] or 0)
+                is_active = int(config_row[3] or 0)
+
+                if is_sold == 1 or is_active != 1:
+                    await db.rollback()
+                    return False, None
+
+                if balance < price:
+                    await db.rollback()
+                    return False, None
+
+                await db.execute(
+                    "UPDATE users SET balance = balance - ? WHERE user_id = ?",
+                    (price, user_id),
+                )
+                update_cursor = await db.execute(
+                    """
+                    UPDATE configs
+                    SET is_sold = 1, sold_to = ?, sold_at = datetime('now')
+                    WHERE id = ? AND is_sold = 0 AND is_active = 1
+                    """,
+                    (user_id, config_id),
+                )
+                if update_cursor.rowcount != 1:
+                    await db.rollback()
+                    return False, None
+
+                await db.execute(
+                    """
+                    INSERT INTO transactions (user_id, amount, type, description, timestamp)
+                    VALUES (?, ?, 'purchase', ?, datetime('now'))
+                    """,
+                    (user_id, price, f"purchase config_id={config_id}"),
+                )
+
+                await db.commit()
+                return True, config_content
+            except Exception:
+                await db.rollback()
+                raise
+
+    async def count_admin_configs(self, model: str) -> int:
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                "SELECT COUNT(*) FROM configs WHERE model = ?",
+                (model,),
+            ) as cursor:
+                row = await cursor.fetchone()
+                return int(row[0]) if row else 0
+
+    async def get_admin_configs(
+        self,
+        model: str,
+        page: int,
+        page_size: int,
+    ) -> list[tuple[int, str, int, str, int, int]]:
+        offset = max(0, (page - 1) * page_size)
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                """
+                SELECT id, title, price, duration, stock, is_active
+                FROM configs
+                WHERE model = ?
+                ORDER BY id DESC
+                LIMIT ? OFFSET ?
+                """,
+                (model, page_size, offset),
+            ) as cursor:
+                rows = await cursor.fetchall()
+                return [
+                    (
+                        int(row[0]),
+                        str(row[1] or ""),
+                        int(row[2] or 0),
+                        str(row[3] or "نامشخص"),
+                        int(row[4] if row[4] is not None else 0),
+                        int(row[5] or 0),
+                    )
+                    for row in rows
+                ]
+
+    async def get_config_for_admin_edit(
+        self,
+        config_id: int,
+    ) -> tuple[int, str, str, int, str, str, int, int, str] | None:
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                """
+                SELECT id, model, title, price, duration, description, stock, is_active, config_content
+                FROM configs
+                WHERE id = ?
+                LIMIT 1
+                """,
+                (config_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+                if not row:
+                    return None
+                return (
+                    int(row[0]),
+                    str(row[1] or ""),
+                    str(row[2] or ""),
+                    int(row[3] or 0),
+                    str(row[4] or "نامشخص"),
+                    str(row[5] or ""),
+                    int(row[6] if row[6] is not None else 0),
+                    int(row[7] or 0),
+                    str(row[8] or ""),
+                )
+
+    async def add_model_config(
+        self,
+        model: str,
+        title: str,
+        price: int,
+        duration: str,
+        description: str,
+        stock: int,
+        config_content: str,
+    ) -> int:
+        category = "Nox Plus" if model == "nox_plus" else "Nox Multi"
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "INSERT OR IGNORE INTO categories (name, price) VALUES (?, ?)",
+                (category, price),
+            )
+            cursor = await db.execute(
+                """
+                INSERT INTO configs (
+                    config_content, category, is_sold, model, title, price, duration,
+                    description, stock, is_active, created_at
+                )
+                VALUES (?, ?, 0, ?, ?, ?, ?, ?, ?, 1, datetime('now'))
+                """,
+                (config_content, category, model, title, price, duration, description, stock),
+            )
+            await db.commit()
+            return int(cursor.lastrowid)
+
+    async def update_model_config(self, config_id: int, field: str, value: int | str) -> bool:
+        allowed_fields = {"title", "price", "duration", "description", "stock", "config_content"}
+        if field not in allowed_fields:
+            return False
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                f"UPDATE configs SET {field} = ? WHERE id = ?",
+                (value, config_id),
+            )
+            await db.commit()
+            return cursor.rowcount == 1
+
+    async def delete_model_config(self, config_id: int) -> bool:
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute("DELETE FROM configs WHERE id = ?", (config_id,))
+            await db.commit()
+            return cursor.rowcount == 1
+
+    async def toggle_model_config_active(self, config_id: int) -> tuple[bool, int | None]:
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                "SELECT is_active FROM configs WHERE id = ?",
+                (config_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            if not row:
+                return False, None
+            new_value = 0 if int(row[0] or 0) == 1 else 1
+            cursor = await db.execute(
+                "UPDATE configs SET is_active = ? WHERE id = ?",
+                (new_value, config_id),
+            )
+            await db.commit()
+            if cursor.rowcount != 1:
+                return False, None
+            return True, new_value

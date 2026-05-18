@@ -11,6 +11,9 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from config import settings
 from database.db_handler import DatabaseHandler
 from keyboards.shop_menu import (
+    build_model_configs_menu,
+    build_model_purchase_confirmation_menu,
+    build_model_selection_menu,
     build_categories_buy_menu,
     build_purchase_confirmation_menu,
     build_recharge_prompt_menu,
@@ -209,22 +212,109 @@ async def recharge_wallet_handler(
 @router.callback_query(F.data == "buy_service")
 async def buy_service_handler(callback: CallbackQuery, db: DatabaseHandler) -> None:
     await callback.answer()
+    await callback.message.answer(
+        "⬇️• یکی از مدل های زیر را انتخاب کنید",
+        reply_markup=build_model_selection_menu(),
+    )
+
+
+@router.callback_query(F.data.startswith("buy_model:"))
+async def buy_model_handler(callback: CallbackQuery, db: DatabaseHandler) -> None:
+    await callback.answer()
+    data_parts = callback.data.split(":")
+    if len(data_parts) != 2:
+        await callback.message.answer("⚠️ درخواست نامعتبر است.")
+        return
+    model = data_parts[1]
+    await send_model_configs_page(callback.message, db, model=model, page=1)
+
+
+@router.callback_query(F.data.startswith("buy_model_page:"))
+async def buy_model_page_handler(callback: CallbackQuery, db: DatabaseHandler) -> None:
+    await callback.answer()
+    data_parts = callback.data.split(":")
+    if len(data_parts) != 3:
+        await callback.message.answer("⚠️ درخواست نامعتبر است.")
+        return
+    model = data_parts[1]
+    if not data_parts[2].isdigit():
+        await callback.message.answer("⚠️ شماره صفحه نامعتبر است.")
+        return
+    page = max(1, int(data_parts[2]))
+    await send_model_configs_page(callback.message, db, model=model, page=page)
+
+
+async def send_model_configs_page(message: Message, db: DatabaseHandler, model: str, page: int) -> None:
+    if model not in {"nox_plus", "nox_multi"}:
+        await message.answer("⚠️ مدل انتخابی معتبر نیست.")
+        return
+
+    page_size = 6
+    try:
+        total_configs = await db.count_active_configs_by_model(model)
+    except Exception:
+        logger.exception("Counting model configs failed for model=%s", model)
+        await message.answer("❌ دریافت لیست سرویس‌ها با خطا مواجه شد.")
+        return
+
+    if total_configs <= 0:
+        await message.answer("📦 در حال حاضر سرویسی برای این مدل موجود نیست.")
+        return
+
+    total_pages = (total_configs + page_size - 1) // page_size
+    safe_page = min(page, total_pages)
+    offset = (safe_page - 1) * page_size
 
     try:
-        all_categories = await db.get_all_categories_with_details()
+        configs = await db.get_active_configs_by_model(model=model, limit=page_size, offset=offset)
     except Exception:
-        logger.exception("Fetching buyable categories failed")
-        await callback.message.answer("❌ دریافت لیست سرویس‌ها با خطا مواجه شد.")
+        logger.exception("Loading model configs failed for model=%s page=%s", model, safe_page)
+        await message.answer("❌ دریافت لیست کانفیگ‌ها با خطا مواجه شد.")
         return
 
-    categories = [category for category in all_categories if category[3] > 0]
-    if not categories:
-        await callback.message.answer("📦 در حال حاضر هیچ سرویسی برای فروش موجود نیست.")
+    model_title = "Nox Plus" if model == "nox_plus" else "Nox Multi"
+    await message.answer(
+        f"مدل انتخابی: {model_title}\n"
+        "یکی از کانفیگ‌ها را انتخاب کنید:",
+        reply_markup=build_model_configs_menu(
+            model=model,
+            configs=configs,
+            page=safe_page,
+            total_pages=total_pages,
+        ),
+    )
+
+
+@router.callback_query(F.data.startswith("buy_config:"))
+async def buy_config_handler(callback: CallbackQuery, db: DatabaseHandler) -> None:
+    await callback.answer()
+    if callback.data is None:
+        return
+    data_parts = callback.data.split(":")
+    if len(data_parts) != 2 or not data_parts[1].isdigit():
+        await callback.message.answer("⚠️ درخواست نامعتبر است.")
         return
 
+    config_id = int(data_parts[1])
+    try:
+        config = await db.get_model_config_details(config_id)
+    except Exception:
+        logger.exception("Loading config details failed for config_id=%s", config_id)
+        await callback.message.answer("❌ دریافت جزئیات کانفیگ با خطا مواجه شد.")
+        return
+
+    if config is None:
+        await callback.message.answer("⚠️ این کانفیگ دیگر موجود نیست.")
+        return
+
+    _, title, price, duration, description, _config_content = config
     await callback.message.answer(
-        "🛍 سرویس مورد نظر را انتخاب کنید:",
-        reply_markup=build_categories_buy_menu(categories),
+        f"📦 {title}\n\n"
+        f"💰 قیمت: {price:,}\n"
+        f"⏳ مدت: {duration}\n\n"
+        "📝 توضیحات:\n"
+        f"{description}".replace(",", "٬"),
+        reply_markup=build_model_purchase_confirmation_menu(config_id),
     )
 
 
@@ -273,13 +363,31 @@ async def confirm_purchase_handler(
         return
 
     user_id = callback.from_user.id
-    category_id = int(callback.data.split(":")[1])
+    payload = callback.data.split(":")[1]
+    if not payload.isdigit():
+        await callback.message.answer("⚠️ درخواست خرید نامعتبر است.")
+        return
+    target_id = int(payload)
 
     try:
-        category = await db.get_category_details(category_id)
+        purchase_completed, config_content = await db.complete_model_purchase(user_id, target_id)
+    except Exception:
+        logger.exception("Completing model purchase failed for user_id=%s config_id=%s", user_id, target_id)
+        purchase_completed, config_content = False, None
+
+    if purchase_completed and config_content:
+        await callback.message.answer(
+            "✅ خرید با موفقیت انجام شد\n\n"
+            "📦 سرویس شما:\n\n"
+            f"{config_content}",
+        )
+        return
+
+    try:
+        category = await db.get_category_details(target_id)
         balance = await db.get_user_balance(user_id)
     except Exception:
-        logger.exception("Loading purchase data failed for user_id=%s category_id=%s", user_id, category_id)
+        logger.exception("Loading purchase data failed for user_id=%s category_id=%s", user_id, target_id)
         await callback.message.answer("❌ بررسی اطلاعات خرید با خطا مواجه شد.")
         return
 
@@ -351,6 +459,11 @@ async def confirm_purchase_handler(
 async def cancel_purchase_flow_handler(callback: CallbackQuery) -> None:
     await callback.answer()
     await callback.message.answer("❌ فرآیند خرید لغو شد.")
+
+
+@router.callback_query(F.data == "noop")
+async def noop_handler(callback: CallbackQuery) -> None:
+    await callback.answer()
 
 
 @router.callback_query(F.data == "my_services")
