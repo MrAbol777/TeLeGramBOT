@@ -167,7 +167,19 @@ async def recent_purchase_history_handler(
         lines.append(f"<code>{safe_config}</code>")
 
     back_builder = InlineKeyboardBuilder()
-    back_builder.button(text="🔙 بازگشت به پروفایل", callback_data="user_profile")
+    back_button_payload = {
+        "text": "🔙 حساب کاربری",
+        "callback_data": "user_profile",
+        "icon_custom_emoji_id": "5372926953978341366",
+    }
+    try:
+        back_button = InlineKeyboardButton(**back_button_payload)
+    except TypeError:
+        back_button = InlineKeyboardButton(
+            text=back_button_payload["text"],
+            callback_data=back_button_payload["callback_data"],
+        )
+    back_builder.row(back_button)
     back_builder.adjust(1)
 
     await callback.message.answer(

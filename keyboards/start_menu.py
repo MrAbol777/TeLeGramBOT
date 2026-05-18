@@ -4,15 +4,35 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 def build_start_menu() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
+    buy_service_payload = {
+        "text": "خرید سرویس",
+        "callback_data": "buy_service",
+        "icon_custom_emoji_id": "5829966475623928907",
+    }
+    try:
+        buy_service_button = InlineKeyboardButton(**buy_service_payload)
+    except TypeError:
+        buy_service_button = InlineKeyboardButton(
+            text=buy_service_payload["text"],
+            callback_data=buy_service_payload["callback_data"],
+        )
+
+    account_button_payload = {
+        "text": "حساب کاربری",
+        "callback_data": "user_profile",
+        "icon_custom_emoji_id": "5372926953978341366",
+    }
+    try:
+        account_button = InlineKeyboardButton(**account_button_payload)
+    except TypeError:
+        account_button = InlineKeyboardButton(
+            text=account_button_payload["text"],
+            callback_data=account_button_payload["callback_data"],
+        )
+
     builder.row(
-        InlineKeyboardButton(
-            text="🛍 خرید سرویس",
-            callback_data="buy_service",
-        ),
-        InlineKeyboardButton(
-            text="🧑‍💻 حساب کاربری",
-            callback_data="user_profile",
-        ),
+        buy_service_button,
+        account_button,
     )
     builder.row(
         InlineKeyboardButton(
