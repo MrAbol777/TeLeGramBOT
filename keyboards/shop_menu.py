@@ -159,3 +159,12 @@ def build_model_purchase_confirmation_menu(config_id: int) -> InlineKeyboardMark
         InlineKeyboardButton(text="❌ Cancel", callback_data="cancel_buy"),
     )
     return builder.as_markup()
+
+
+def build_insufficient_balance_menu(model: str) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="💳 افزایش موجودی", callback_data="recharge_wallet"),
+        InlineKeyboardButton(text="⬅️ بازگشت", callback_data=f"buy_model:{model}"),
+    )
+    return builder.as_markup()

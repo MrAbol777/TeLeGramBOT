@@ -10,7 +10,7 @@ def build_admin_menu() -> ReplyKeyboardMarkup:
             [KeyboardButton(text="📈 گزارش فروش")],
             [KeyboardButton(text="📊 گزارش فروش")],
             [KeyboardButton(text="📢 ارسال همگانی")],
-            [KeyboardButton(text="💳 تنظیم شماره کارت")],
+            [KeyboardButton(text="💳 مدیریت پرداخت")],
             [KeyboardButton(text="➕ افزودن کانفیگ جدید")],
             [KeyboardButton(text="💰 مدیریت قیمت‌ها")],
             [KeyboardButton(text="مدیریت سرویس‌ها")],

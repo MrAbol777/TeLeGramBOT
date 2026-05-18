@@ -57,6 +57,29 @@ class DatabaseHandler:
             )
             await db.execute(
                 """
+                CREATE TABLE IF NOT EXISTS payment_settings (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    card_number TEXT NOT NULL DEFAULT '',
+                    card_holder_name TEXT NOT NULL DEFAULT ''
+                )
+                """
+            )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS recharge_requests (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    username TEXT,
+                    amount INTEGER NOT NULL,
+                    receipt_file_id TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending'
+                        CHECK(status IN ('pending', 'approved', 'rejected')),
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                )
+                """
+            )
+            await db.execute(
+                """
                 CREATE TABLE IF NOT EXISTS sales (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id INTEGER,
@@ -66,6 +89,17 @@ class DatabaseHandler:
                     title TEXT,
                     price INTEGER,
                     purchased_at TEXT DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS config_items (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    config_id INTEGER NOT NULL,
+                    content TEXT NOT NULL,
+                    is_used INTEGER DEFAULT 0,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
                 )
                 """
             )
@@ -103,6 +137,10 @@ class DatabaseHandler:
             except aiosqlite.OperationalError:
                 pass
             try:
+                await db.execute("ALTER TABLE configs ADD COLUMN speed TEXT DEFAULT 'نامشخص'")
+            except aiosqlite.OperationalError:
+                pass
+            try:
                 await db.execute("ALTER TABLE configs ADD COLUMN description TEXT DEFAULT ''")
             except aiosqlite.OperationalError:
                 pass
@@ -130,6 +168,7 @@ class DatabaseHandler:
                     title = COALESCE(NULLIF(TRIM(title), ''), category, 'Config #' || id),
                     price = COALESCE(price, 0),
                     duration = COALESCE(NULLIF(TRIM(duration), ''), 'نامشخص'),
+                    speed = COALESCE(NULLIF(TRIM(speed), ''), 'نامشخص'),
                     description = COALESCE(description, ''),
                     stock = CASE
                         WHEN stock IS NULL AND is_sold = 0 THEN 1
@@ -173,6 +212,12 @@ class DatabaseHandler:
                 WHERE category IS NOT NULL AND TRIM(category) != ''
                 """
             )
+            await db.execute(
+                """
+                INSERT OR IGNORE INTO payment_settings (id, card_number, card_holder_name)
+                VALUES (1, '', '')
+                """
+            )
             await db.commit()
 
     async def get_setting(self, key: str, default: str | None = None) -> str | None:
@@ -195,6 +240,172 @@ class DatabaseHandler:
                 (key, value),
             )
             await db.commit()
+
+    async def get_payment_settings(self) -> tuple[str, str]:
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                """
+                SELECT card_number, card_holder_name
+                FROM payment_settings
+                WHERE id = 1
+                LIMIT 1
+                """
+            ) as cursor:
+                row = await cursor.fetchone()
+                if not row:
+                    return "", ""
+                return str(row[0] or ""), str(row[1] or "")
+
+    async def set_payment_card_number(self, card_number: str) -> None:
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """
+                INSERT INTO payment_settings (id, card_number, card_holder_name)
+                VALUES (1, ?, '')
+                ON CONFLICT(id) DO UPDATE SET card_number = excluded.card_number
+                """,
+                (card_number,),
+            )
+            await db.commit()
+
+    async def set_payment_card_holder_name(self, card_holder_name: str) -> None:
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """
+                INSERT INTO payment_settings (id, card_number, card_holder_name)
+                VALUES (1, '', ?)
+                ON CONFLICT(id) DO UPDATE SET card_holder_name = excluded.card_holder_name
+                """,
+                (card_holder_name,),
+            )
+            await db.commit()
+
+    async def create_recharge_request(
+        self,
+        user_id: int,
+        username: str | None,
+        amount: int,
+        receipt_file_id: str,
+    ) -> int:
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                """
+                INSERT INTO recharge_requests (user_id, username, amount, receipt_file_id, status, created_at)
+                VALUES (?, ?, ?, ?, 'pending', datetime('now'))
+                """,
+                (user_id, username, amount, receipt_file_id),
+            )
+            await db.commit()
+            return int(cursor.lastrowid)
+
+    async def get_recharge_request(
+        self,
+        request_id: int,
+    ) -> tuple[int, int, str | None, int, str, str, str] | None:
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                """
+                SELECT id, user_id, username, amount, receipt_file_id, status, created_at
+                FROM recharge_requests
+                WHERE id = ?
+                LIMIT 1
+                """,
+                (request_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+                if not row:
+                    return None
+                return (
+                    int(row[0]),
+                    int(row[1]),
+                    str(row[2]) if row[2] is not None else None,
+                    int(row[3]),
+                    str(row[4]),
+                    str(row[5]),
+                    str(row[6]),
+                )
+
+    async def approve_recharge_request(self, request_id: int) -> tuple[bool, int | None, int | None]:
+        async with aiosqlite.connect(self.db_path) as db:
+            try:
+                await db.execute("BEGIN IMMEDIATE")
+                async with db.execute(
+                    "SELECT user_id, amount, status FROM recharge_requests WHERE id = ?",
+                    (request_id,),
+                ) as cursor:
+                    row = await cursor.fetchone()
+                if not row:
+                    await db.rollback()
+                    return False, None, None
+
+                user_id = int(row[0])
+                amount = int(row[1])
+                status = str(row[2] or "")
+                if status != "pending":
+                    await db.rollback()
+                    return False, user_id, amount
+
+                await db.execute(
+                    "INSERT OR IGNORE INTO users (user_id) VALUES (?)",
+                    (user_id,),
+                )
+                await db.execute(
+                    "UPDATE users SET balance = balance + ? WHERE user_id = ?",
+                    (amount, user_id),
+                )
+                await db.execute(
+                    """
+                    UPDATE recharge_requests
+                    SET status = 'approved'
+                    WHERE id = ? AND status = 'pending'
+                    """,
+                    (request_id,),
+                )
+                await db.execute(
+                    """
+                    INSERT INTO transactions (user_id, amount, type, description, timestamp)
+                    VALUES (?, ?, 'recharge', ?, datetime('now'))
+                    """,
+                    (user_id, amount, f"recharge request approved id={request_id}"),
+                )
+                await db.commit()
+                return True, user_id, amount
+            except Exception:
+                await db.rollback()
+                raise
+
+    async def reject_recharge_request(self, request_id: int) -> tuple[bool, int | None]:
+        async with aiosqlite.connect(self.db_path) as db:
+            try:
+                await db.execute("BEGIN IMMEDIATE")
+                async with db.execute(
+                    "SELECT user_id, status FROM recharge_requests WHERE id = ?",
+                    (request_id,),
+                ) as cursor:
+                    row = await cursor.fetchone()
+                if not row:
+                    await db.rollback()
+                    return False, None
+
+                user_id = int(row[0])
+                status = str(row[1] or "")
+                if status != "pending":
+                    await db.rollback()
+                    return False, user_id
+
+                await db.execute(
+                    """
+                    UPDATE recharge_requests
+                    SET status = 'rejected'
+                    WHERE id = ? AND status = 'pending'
+                    """,
+                    (request_id,),
+                )
+                await db.commit()
+                return True, user_id
+            except Exception:
+                await db.rollback()
+                raise
 
     async def add_user_if_not_exists(self, user_id: int) -> None:
         async with aiosqlite.connect(self.db_path) as db:
@@ -639,7 +850,7 @@ class DatabaseHandler:
                 """
                 SELECT id, title, price, duration, description, config_content
                 FROM configs
-                WHERE id = ? AND is_active = 1 AND is_sold = 0
+                WHERE id = ? AND is_active = 1 AND (stock = -1 OR stock > 0)
                 LIMIT 1
                 """,
                 (config_id,),
@@ -678,7 +889,7 @@ class DatabaseHandler:
                     return False, None
 
                 price = int(config_row[0] or 0)
-                config_content = str(config_row[1])
+                default_config_content = str(config_row[1] or "")
                 is_sold = int(config_row[2] or 0)
                 is_active = int(config_row[3] or 0)
                 stock = int(config_row[4] if config_row[4] is not None else 0)
@@ -694,15 +905,51 @@ class DatabaseHandler:
                     await db.rollback()
                     return False, None
 
+                selected_item_id: int | None = None
+                config_content = default_config_content
+                async with db.execute(
+                    """
+                    SELECT id, content
+                    FROM config_items
+                    WHERE config_id = ? AND is_used = 0
+                    ORDER BY id
+                    LIMIT 1
+                    """,
+                    (config_id,),
+                ) as cursor:
+                    item_row = await cursor.fetchone()
+                if item_row is not None:
+                    selected_item_id = int(item_row[0])
+                    config_content = str(item_row[1])
+                elif stock > 0:
+                    await db.rollback()
+                    return False, None
+
                 await db.execute(
                     "UPDATE users SET balance = balance - ? WHERE user_id = ?",
                     (price, user_id),
                 )
+                if selected_item_id is not None:
+                    item_update = await db.execute(
+                        """
+                        UPDATE config_items
+                        SET is_used = 1
+                        WHERE id = ? AND is_used = 0
+                        """,
+                        (selected_item_id,),
+                    )
+                    if item_update.rowcount != 1:
+                        await db.rollback()
+                        return False, None
                 update_cursor = await db.execute(
                     """
                     UPDATE configs
                     SET
-                        is_sold = 1,
+                        is_sold = CASE
+                            WHEN stock = -1 THEN 0
+                            WHEN stock > 1 THEN 0
+                            ELSE 1
+                        END,
                         sold_to = ?,
                         sold_at = datetime('now'),
                         stock = CASE
@@ -735,11 +982,11 @@ class DatabaseHandler:
     async def get_model_config_purchase_snapshot(
         self,
         config_id: int,
-    ) -> tuple[int, str, int, str, str, str, int, int, int] | None:
+    ) -> tuple[int, str, int, str, str, str, str, int, int, int] | None:
         async with aiosqlite.connect(self.db_path) as db:
             async with db.execute(
                 """
-                SELECT id, title, price, duration, description, config_content, stock, is_active, is_sold
+                SELECT id, title, price, duration, description, config_content, model, stock, is_active, is_sold
                 FROM configs
                 WHERE id = ?
                 LIMIT 1
@@ -756,9 +1003,10 @@ class DatabaseHandler:
                     str(row[3] or "نامشخص"),
                     str(row[4] or ""),
                     str(row[5] or ""),
-                    int(row[6] if row[6] is not None else 0),
-                    int(row[7] or 0),
+                    str(row[6] or ""),
+                    int(row[7] if row[7] is not None else 0),
                     int(row[8] or 0),
+                    int(row[9] or 0),
                 )
 
     async def count_admin_configs(self, model: str) -> int:
@@ -804,11 +1052,11 @@ class DatabaseHandler:
     async def get_config_for_admin_edit(
         self,
         config_id: int,
-    ) -> tuple[int, str, str, int, str, str, int, int, str] | None:
+    ) -> tuple[int, str, str, int, str, str, str, int, int, str] | None:
         async with aiosqlite.connect(self.db_path) as db:
             async with db.execute(
                 """
-                SELECT id, model, title, price, duration, description, stock, is_active, config_content
+                SELECT id, model, title, price, duration, speed, description, stock, is_active, config_content
                 FROM configs
                 WHERE id = ?
                 LIMIT 1
@@ -825,9 +1073,10 @@ class DatabaseHandler:
                     int(row[3] or 0),
                     str(row[4] or "نامشخص"),
                     str(row[5] or ""),
-                    int(row[6] if row[6] is not None else 0),
-                    int(row[7] or 0),
-                    str(row[8] or ""),
+                    str(row[6] or ""),
+                    int(row[7] if row[7] is not None else 0),
+                    int(row[8] or 0),
+                    str(row[9] or ""),
                 )
 
     async def add_model_config(
@@ -836,6 +1085,7 @@ class DatabaseHandler:
         title: str,
         price: int,
         duration: str,
+        speed: str,
         description: str,
         stock: int,
         config_content: str,
@@ -850,17 +1100,61 @@ class DatabaseHandler:
                 """
                 INSERT INTO configs (
                     config_content, category, is_sold, model, title, price, duration,
-                    description, stock, is_active, created_at
+                    speed, description, stock, is_active, created_at
                 )
-                VALUES (?, ?, 0, ?, ?, ?, ?, ?, ?, 1, datetime('now'))
+                VALUES (?, ?, 0, ?, ?, ?, ?, ?, ?, ?, 1, datetime('now'))
                 """,
-                (config_content, category, model, title, price, duration, description, stock),
+                (config_content, category, model, title, price, duration, speed, description, stock),
             )
             await db.commit()
             return int(cursor.lastrowid)
 
+    async def add_model_config_with_items(
+        self,
+        model: str,
+        title: str,
+        price: int,
+        duration: str,
+        speed: str,
+        description: str,
+        stock: int,
+        config_items: list[str],
+    ) -> int:
+        category = "Nox Plus" if model == "nox_plus" else "Nox Multi"
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                await db.execute(
+                    "INSERT OR IGNORE INTO categories (name, price) VALUES (?, ?)",
+                    (category, price),
+                )
+                cursor = await db.execute(
+                    """
+                    INSERT INTO configs (
+                        config_content, category, is_sold, model, title, price, duration,
+                        speed, description, stock, is_active, created_at
+                    )
+                    VALUES (?, ?, 0, ?, ?, ?, ?, ?, ?, ?, 1, datetime('now'))
+                    """,
+                    ("", category, model, title, price, duration, speed, description, stock),
+                )
+                config_id = int(cursor.lastrowid)
+                for item in config_items:
+                    await db.execute(
+                        """
+                        INSERT INTO config_items (config_id, content, is_used)
+                        VALUES (?, ?, 0)
+                        """,
+                        (config_id, item),
+                    )
+                await db.commit()
+                return config_id
+            except Exception:
+                await db.rollback()
+                raise
+
     async def update_model_config(self, config_id: int, field: str, value: int | str) -> bool:
-        allowed_fields = {"title", "price", "duration", "description", "stock", "config_content"}
+        allowed_fields = {"title", "price", "duration", "speed", "description", "stock", "config_content"}
         if field not in allowed_fields:
             return False
         async with aiosqlite.connect(self.db_path) as db:

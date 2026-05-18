@@ -12,6 +12,7 @@ from config import settings
 from database.db_handler import DatabaseHandler
 from keyboards.shop_menu import (
     build_model_configs_menu,
+    build_insufficient_balance_menu,
     build_model_purchase_confirmation_menu,
     build_model_selection_menu,
     build_categories_buy_menu,
@@ -24,6 +25,7 @@ from utils.states import RechargeStates
 logger = logging.getLogger(__name__)
 
 router = Router(name="user_menu")
+MIN_RECHARGE_AMOUNT = 10_000
 
 PROFILE_MESSAGE = """
 <tg-emoji emoji-id='5190458330719461749'>🧑‍💻</tg-emoji>
@@ -37,16 +39,20 @@ PROFILE_MESSAGE = """
 """.strip()
 
 
-def build_receipt_review_keyboard(user_id: int) -> InlineKeyboardBuilder:
+def format_toman(amount: int) -> str:
+    return f"{amount:,}".replace(",", "٬")
+
+
+def build_receipt_review_keyboard(request_id: int) -> InlineKeyboardBuilder:
     builder = InlineKeyboardBuilder()
     builder.row(
         InlineKeyboardButton(
             text="تایید ✅",
-            callback_data=f"approve_receipt:{user_id}",
+            callback_data=f"approve_recharge:{request_id}",
         ),
         InlineKeyboardButton(
             text="رد ❌",
-            callback_data=f"reject_receipt:{user_id}",
+            callback_data=f"reject_recharge:{request_id}",
         ),
     )
     return builder
@@ -199,13 +205,51 @@ async def recharge_wallet_handler(
     db: DatabaseHandler,
 ) -> None:
     await callback.answer()
-    await state.set_state(RechargeStates.waiting_for_receipt)
-    card_number = await db.get_setting("admin_card_number", settings.ADMIN_CARD_NUMBER)
+    await state.set_state(RechargeStates.waiting_amount)
     await callback.message.answer(
-        "💳 برای شارژ حساب، مبلغ را به شماره کارت زیر واریز کنید:\n"
-        f"`{card_number}`\n\n"
-        "📸 سپس عکس فیش واریزی را همین‌جا ارسال کنید.",
-        parse_mode="Markdown",
+        "💳 شارژ کیف پول\n\n"
+        "لطفاً مبلغ مورد نظر خود را به تومان وارد کنید.\n\n"
+        "مثال:\n"
+        "50000\n"
+        "100000\n"
+        "250000",
+    )
+
+
+@router.message(RechargeStates.waiting_amount, F.text)
+async def recharge_amount_handler(message: Message, state: FSMContext, db: DatabaseHandler) -> None:
+    if message.from_user is None:
+        return
+
+    raw_amount = message.text.replace("٬", "").replace(",", "").strip()
+    if not raw_amount.isdigit():
+        await message.answer("⚠️ لطفاً مبلغ را فقط به‌صورت عددی وارد کنید. مثال: `50000`", parse_mode="Markdown")
+        return
+
+    amount = int(raw_amount)
+    if amount < MIN_RECHARGE_AMOUNT:
+        await message.answer(
+            f"⚠️ حداقل مبلغ شارژ {format_toman(MIN_RECHARGE_AMOUNT)} تومان است."
+        )
+        return
+
+    card_number, card_holder_name = await db.get_payment_settings()
+    if not card_number:
+        card_number = settings.ADMIN_CARD_NUMBER
+    if not card_holder_name:
+        card_holder_name = "تنظیم نشده"
+
+    await state.update_data(recharge_amount=amount)
+    await state.set_state(RechargeStates.waiting_for_receipt)
+    await message.answer(
+        "💳 درخواست شارژ ثبت شد\n\n"
+        f"💰 مبلغ: {format_toman(amount)} تومان\n\n"
+        "لطفاً مبلغ بالا را به کارت زیر واریز کنید:\n\n"
+        "🏦 شماره کارت\n"
+        f"{card_number}\n\n"
+        "👤 به نام\n"
+        f"{card_holder_name}\n\n"
+        "پس از واریز، تصویر رسید پرداخت را ارسال کنید."
     )
 
 
@@ -483,12 +527,31 @@ async def confirm_buy_handler(callback: CallbackQuery, db: DatabaseHandler) -> N
         await callback.message.answer("⚠️ این سرویس دیگر موجود نیست.")
         return
 
-    _id, title, price, _duration, _description, _content, stock, is_active, is_sold = snapshot
+    _id, title, price, _duration, _description, _content, model, stock, is_active, is_sold = snapshot
     if is_active != 1:
         await callback.message.answer("این سرویس در حال حاضر غیرفعال است.")
         return
     if stock == 0 or is_sold == 1:
         await callback.message.answer("موجودی این سرویس به پایان رسیده است.")
+        return
+
+    try:
+        balance = await db.get_user_balance(user_id)
+    except Exception:
+        logger.exception("Loading user balance failed for user_id=%s", user_id)
+        await callback.message.answer("❌ بررسی موجودی کیف پول با خطا مواجه شد.")
+        return
+
+    if balance < price:
+        shortage = price - balance
+        await callback.message.answer(
+            "❌ موجودی شما کافی نیست\n\n"
+            f"💰 قیمت سرویس: {format_toman(price)} تومان\n"
+            f"👛 موجودی فعلی شما: {format_toman(balance)} تومان\n"
+            f"📉 مبلغ کسری: {format_toman(shortage)} تومان\n\n"
+            "لطفاً ابتدا حساب خود را شارژ کنید.",
+            reply_markup=build_insufficient_balance_menu(model),
+        )
         return
 
     try:
@@ -608,21 +671,33 @@ async def receipt_photo_handler(
         return
 
     user = message.from_user
-    caption_lines = [
-        "📥 فیش جدید برای بررسی",
-        f"🆔 شناسه کاربر: {user.id}",
-    ]
-    if user.username:
-        caption_lines.append(f"👤 نام کاربری: @{user.username}")
-    caption_lines.append("⚠️ یکی از گزینه‌های زیر را انتخاب کنید.")
+    state_data = await state.get_data()
+    amount = int(state_data.get("recharge_amount", 0))
+    if amount <= 0:
+        await state.clear()
+        await message.answer("⚠️ مبلغ شارژ پیدا نشد. لطفاً دوباره از بخش شارژ حساب شروع کنید.")
+        return
 
     try:
         await db.add_user_if_not_exists(user.id)
+        request_id = await db.create_recharge_request(
+            user_id=user.id,
+            username=user.username,
+            amount=amount,
+            receipt_file_id=message.photo[-1].file_id,
+        )
+        username_text = f"@{user.username}" if user.username else "ندارد"
         await bot.send_photo(
             chat_id=settings.ADMIN_ID,
             photo=message.photo[-1].file_id,
-            caption="\n".join(caption_lines),
-            reply_markup=build_receipt_review_keyboard(user.id).as_markup(),
+            caption=(
+                "💳 درخواست شارژ جدید\n\n"
+                f"👤 کاربر: {username_text}\n"
+                f"🆔 ID: {user.id}\n\n"
+                f"💰 مبلغ: {format_toman(amount)} تومان\n"
+                f"🧾 شماره درخواست: {request_id}"
+            ),
+            reply_markup=build_receipt_review_keyboard(request_id).as_markup(),
         )
     except Exception:
         logger.exception("Forwarding receipt failed for user_id=%s", user.id)
@@ -631,6 +706,11 @@ async def receipt_photo_handler(
 
     await state.clear()
     await message.answer("✅ فیش شما دریافت شد و برای بررسی به ادمین ارسال شد.")
+
+
+@router.message(RechargeStates.waiting_amount)
+async def invalid_recharge_amount_handler(message: Message) -> None:
+    await message.answer("⚠️ لطفاً مبلغ شارژ را فقط به‌صورت متنی و عددی ارسال کنید.")
 
 
 @router.message(RechargeStates.waiting_for_receipt)

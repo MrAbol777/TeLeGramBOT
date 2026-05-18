@@ -20,13 +20,17 @@ from database.db_handler import DatabaseHandler
 from keyboards.admin_menu import build_admin_menu
 from keyboards.shop_menu import build_admin_category_price_menu
 from keyboards.start_menu import build_start_menu
-from utils.states import AdminPriceStates, AdminRechargeStates, AdminServiceStates, AdminStates
+from utils.states import AdminPriceStates, AdminServiceStates, AdminStates
 
 logger = logging.getLogger(__name__)
 
 router = Router(name="admin")
 router.message.filter(F.from_user.id == settings.ADMIN_ID)
 router.callback_query.filter(F.from_user.id == settings.ADMIN_ID)
+
+
+def format_toman(amount: int) -> str:
+    return f"{amount:,}".replace(",", "٬")
 
 
 def build_broadcast_preview_keyboard() -> InlineKeyboardBuilder:
@@ -130,6 +134,7 @@ def build_edit_config_keyboard(config_id: int) -> InlineKeyboardMarkup:
     builder.row(InlineKeyboardButton(text="تغییر عنوان", callback_data=f"admin_edit_field:{config_id}:title"))
     builder.row(InlineKeyboardButton(text="تغییر قیمت", callback_data=f"admin_edit_field:{config_id}:price"))
     builder.row(InlineKeyboardButton(text="تغییر مدت", callback_data=f"admin_edit_field:{config_id}:duration"))
+    builder.row(InlineKeyboardButton(text="تغییر سرعت", callback_data=f"admin_edit_field:{config_id}:speed"))
     builder.row(
         InlineKeyboardButton(text="تغییر توضیحات", callback_data=f"admin_edit_field:{config_id}:description")
     )
@@ -153,6 +158,12 @@ def build_sales_report_keyboard() -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="🔄 بروزرسانی", callback_data="refresh_sales_report"),
         InlineKeyboardButton(text="⬅️ بازگشت", callback_data="admin_back:main_admin_menu"),
     )
+    return builder.as_markup()
+
+
+def build_finish_collecting_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="✅ اتمام کار", callback_data="admin_finish_collecting_configs"))
     return builder.as_markup()
 
 
@@ -191,7 +202,7 @@ async def _send_admin_edit_config(message: Message, db: DatabaseHandler, config_
         await message.answer("⚠️ کانفیگ پیدا نشد.")
         return
 
-    _, model, title, price, duration, description, stock, is_active, config_content = config
+    _, model, title, price, duration, speed, description, stock, is_active, config_content = config
     status = "فعال" if is_active == 1 else "غیرفعال"
     await message.answer(
         f"جزئیات کانفیگ #{config_id}\n"
@@ -199,6 +210,7 @@ async def _send_admin_edit_config(message: Message, db: DatabaseHandler, config_
         f"عنوان: {title}\n"
         f"قیمت: {price:,} تومان\n"
         f"مدت: {duration}\n"
+        f"سرعت: {speed}\n"
         f"توضیحات: {description}\n"
         f"موجودی: {_stock_text(stock)}\n"
         f"وضعیت: {status}\n\n"
@@ -611,137 +623,64 @@ async def set_category_price_handler(
     )
 
 
-def build_amount_keyboard(user_id: int) -> InlineKeyboardBuilder:
-    builder = InlineKeyboardBuilder()
-    for amount in (50000, 100000, 200000):
-        builder.add(
-            InlineKeyboardButton(
-                text=f"{amount:,} تومان".replace(",", "٬"),
-                callback_data=f"receipt_amount:{user_id}:{amount}",
-            )
-        )
-    builder.adjust(1)
-    return builder
-
-
-@router.callback_query(F.data.startswith("approve_receipt:"))
-async def approve_receipt_handler(callback: CallbackQuery, state: FSMContext) -> None:
+@router.callback_query(F.data.startswith("approve_recharge:"))
+async def approve_recharge_handler(callback: CallbackQuery, db: DatabaseHandler, bot: Bot) -> None:
     await callback.answer()
-    user_id = int(callback.data.split(":")[1])
-    await state.set_state(AdminRechargeStates.waiting_for_amount)
-    await state.update_data(target_user_id=user_id)
+    request_id_text = callback.data.split(":", 1)[1]
+    if not request_id_text.isdigit():
+        await callback.message.answer("⚠️ شناسه درخواست نامعتبر است.")
+        return
+    request_id = int(request_id_text)
+
+    try:
+        approved, user_id, amount = await db.approve_recharge_request(request_id)
+    except Exception:
+        logger.exception("Approving recharge request failed request_id=%s", request_id)
+        await callback.message.answer("❌ تایید درخواست با خطا مواجه شد.")
+        return
+
+    if not approved:
+        await callback.message.answer("⚠️ این درخواست قبلاً بررسی شده است یا وجود ندارد.")
+        return
+
+    new_balance = await db.get_user_balance(int(user_id))
+    await bot.send_message(
+        int(user_id),
+        "✅ شارژ حساب شما تایید شد\n\n"
+        f"💰 مبلغ شارژ: {format_toman(int(amount))} تومان\n"
+        f"👛 موجودی جدید: {format_toman(new_balance)} تومان",
+    )
     await callback.message.answer(
-        "💳 مبلغ شارژ را انتخاب کنید یا عدد مبلغ را به تومان بفرستید.",
-        reply_markup=build_amount_keyboard(user_id).as_markup(),
+        f"✅ درخواست #{request_id} تایید شد و مبلغ {format_toman(int(amount))} تومان شارژ شد."
     )
 
 
-@router.callback_query(F.data.startswith("receipt_amount:"))
-async def quick_amount_handler(
-    callback: CallbackQuery,
-    state: FSMContext,
-    db: DatabaseHandler,
-    bot: Bot,
-) -> None:
+@router.callback_query(F.data.startswith("reject_recharge:"))
+async def reject_recharge_handler(callback: CallbackQuery, db: DatabaseHandler, bot: Bot) -> None:
     await callback.answer()
-    _, user_id_text, amount_text = callback.data.split(":")
-    user_id = int(user_id_text)
-    amount = int(amount_text)
-
-    await apply_wallet_charge(
-        message=callback.message,
-        state=state,
-        db=db,
-        bot=bot,
-        user_id=user_id,
-        amount=amount,
-    )
-
-
-@router.message(AdminRechargeStates.waiting_for_amount, F.text)
-async def manual_amount_handler(
-    message: Message,
-    state: FSMContext,
-    db: DatabaseHandler,
-    bot: Bot,
-) -> None:
-    cleaned_amount = message.text.replace("٬", "").replace(",", "").strip()
-    if not cleaned_amount.isdigit():
-        await message.answer("⚠️ مبلغ باید فقط عدد باشد. مثلاً `150000`", parse_mode="Markdown")
+    request_id_text = callback.data.split(":", 1)[1]
+    if not request_id_text.isdigit():
+        await callback.message.answer("⚠️ شناسه درخواست نامعتبر است.")
         return
-
-    state_data = await state.get_data()
-    user_id = state_data.get("target_user_id")
-    if not user_id:
-        await state.clear()
-        await message.answer("⚠️ اطلاعات کاربر پیدا نشد. لطفاً دوباره از ابتدا اقدام کنید.")
-        return
-
-    await apply_wallet_charge(
-        message=message,
-        state=state,
-        db=db,
-        bot=bot,
-        user_id=int(user_id),
-        amount=int(cleaned_amount),
-    )
-
-
-async def apply_wallet_charge(
-    message: Message,
-    state: FSMContext,
-    db: DatabaseHandler,
-    bot: Bot,
-    user_id: int,
-    amount: int,
-) -> None:
-    if amount <= 0:
-        await message.answer("⚠️ مبلغ باید بیشتر از صفر باشد.")
-        return
+    request_id = int(request_id_text)
 
     try:
-        await db.update_balance(user_id, amount)
-        await db.add_transaction(
-            user_id=user_id,
-            amount=amount,
-            txn_type="recharge",
-            description="admin approved recharge",
-        )
-        new_balance = await db.get_user_balance(user_id)
-        await bot.send_message(
-            user_id,
-            f"✅ فیش شما تایید شد و کیف پول‌تان به مبلغ {amount:,} تومان شارژ شد.\n"
-            f"💰 موجودی فعلی: {new_balance:,} تومان".replace(",", "٬"),
-        )
+        rejected, user_id = await db.reject_recharge_request(request_id)
     except Exception:
-        logger.exception("Approving receipt failed for user_id=%s amount=%s", user_id, amount)
-        await message.answer("❌ شارژ کیف پول با خطا مواجه شد. دوباره تلاش کنید.")
+        logger.exception("Rejecting recharge request failed request_id=%s", request_id)
+        await callback.message.answer("❌ رد درخواست با خطا مواجه شد.")
         return
 
-    await state.clear()
-    await message.answer(
-        f"✅ کیف پول کاربر `{user_id}` به مبلغ {amount:,} تومان شارژ شد.".replace(",", "٬"),
-        parse_mode="Markdown",
-        reply_markup=build_admin_menu(),
+    if not rejected:
+        await callback.message.answer("⚠️ این درخواست قبلاً بررسی شده است یا وجود ندارد.")
+        return
+
+    await bot.send_message(
+        int(user_id),
+        "❌ درخواست شارژ شما رد شد.\n\n"
+        "در صورت بروز مشکل با پشتیبانی تماس بگیرید.",
     )
-
-
-@router.callback_query(F.data.startswith("reject_receipt:"))
-async def reject_receipt_handler(callback: CallbackQuery, bot: Bot) -> None:
-    await callback.answer()
-    user_id = int(callback.data.split(":")[1])
-
-    try:
-        await bot.send_message(
-            user_id,
-            "❌ فیش شما مورد تایید نبود. لطفاً اطلاعات واریز را بررسی کرده و دوباره ارسال کنید.",
-        )
-    except Exception:
-        logger.exception("Rejecting receipt notification failed for user_id=%s", user_id)
-        await callback.message.answer("⚠️ فیش رد شد، اما ارسال پیام به کاربر ناموفق بود.")
-        return
-
-    await callback.message.answer("❌ فیش کاربر رد شد.", reply_markup=build_admin_menu())
+    await callback.message.answer(f"❌ درخواست #{request_id} رد شد.")
 
 
 @router.message(F.text == "📢 ارسال همگانی")
@@ -833,21 +772,39 @@ async def cancel_broadcast_handler(callback: CallbackQuery, state: FSMContext) -
     await callback.message.answer("❌ ارسال همگانی لغو شد.", reply_markup=build_admin_menu())
 
 
-@router.message(F.text == "💳 تنظیم شماره کارت")
-async def set_card_number_start_handler(message: Message, state: FSMContext, db: DatabaseHandler) -> None:
-    current_card = await db.get_setting("admin_card_number", settings.ADMIN_CARD_NUMBER)
+@router.message(F.text == "💳 مدیریت پرداخت")
+async def payment_management_handler(message: Message, db: DatabaseHandler) -> None:
+    card_number, card_holder_name = await db.get_payment_settings()
+    shown_card = card_number or settings.ADMIN_CARD_NUMBER
+    shown_name = card_holder_name or "تنظیم نشده"
+
+    builder = ReplyKeyboardBuilder()
+    builder.row(KeyboardButton(text="ویرایش شماره کارت"))
+    builder.row(KeyboardButton(text="ویرایش نام صاحب کارت"))
+    builder.row(KeyboardButton(text="🔙 بازگشت به منوی ادمین"))
+    await message.answer(
+        "💳 مدیریت پرداخت\n\n"
+        f"شماره کارت فعلی: `{shown_card}`\n"
+        f"نام صاحب کارت: {shown_name}",
+        parse_mode="Markdown",
+        reply_markup=builder.as_markup(resize_keyboard=True),
+    )
+
+@router.message(F.text == "ویرایش شماره کارت")
+async def edit_payment_card_start_handler(message: Message, state: FSMContext, db: DatabaseHandler) -> None:
+    current_card, _ = await db.get_payment_settings()
+    shown_card = current_card or settings.ADMIN_CARD_NUMBER
     await state.set_state(AdminStates.waiting_for_card_number)
     await message.answer(
-        "💳 تنظیم شماره کارت\n"
-        f"شماره کارت فعلی: `{current_card}`\n\n"
+        "💳 ویرایش شماره کارت\n"
+        f"شماره کارت فعلی: `{shown_card}`\n\n"
         "شماره کارت جدید را ارسال کنید.",
         parse_mode="Markdown",
-        reply_markup=build_admin_menu(),
     )
 
 
 @router.message(AdminStates.waiting_for_card_number, F.text)
-async def set_card_number_handler(message: Message, state: FSMContext, db: DatabaseHandler) -> None:
+async def set_payment_card_number_handler(message: Message, state: FSMContext, db: DatabaseHandler) -> None:
     card_number = message.text.strip().replace(" ", "").replace("-", "")
     if not card_number.isdigit() or len(card_number) != 16:
         await message.answer(
@@ -859,9 +816,9 @@ async def set_card_number_handler(message: Message, state: FSMContext, db: Datab
         return
 
     try:
-        await db.set_setting("admin_card_number", card_number)
+        await db.set_payment_card_number(card_number)
     except Exception:
-        logger.exception("Updating admin card number failed")
+        logger.exception("Updating payment card number failed")
         await message.answer("❌ ذخیره شماره کارت با خطا مواجه شد.")
         return
 
@@ -871,6 +828,44 @@ async def set_card_number_handler(message: Message, state: FSMContext, db: Datab
         parse_mode="Markdown",
         reply_markup=build_admin_menu(),
     )
+
+
+@router.message(F.text == "ویرایش نام صاحب کارت")
+async def edit_card_holder_name_start_handler(message: Message, state: FSMContext, db: DatabaseHandler) -> None:
+    _card_number, card_holder_name = await db.get_payment_settings()
+    await state.set_state(AdminStates.waiting_for_card_holder_name)
+    await message.answer(
+        "👤 ویرایش نام صاحب کارت\n"
+        f"نام فعلی: {card_holder_name or 'تنظیم نشده'}\n\n"
+        "نام جدید را ارسال کنید.",
+    )
+
+
+@router.message(AdminStates.waiting_for_card_holder_name, F.text)
+async def set_card_holder_name_handler(message: Message, state: FSMContext, db: DatabaseHandler) -> None:
+    card_holder_name = message.text.strip()
+    if len(card_holder_name) < 3:
+        await message.answer("⚠️ نام صاحب کارت معتبر نیست.")
+        return
+
+    try:
+        await db.set_payment_card_holder_name(card_holder_name)
+    except Exception:
+        logger.exception("Updating card holder name failed")
+        await message.answer("❌ ذخیره نام صاحب کارت با خطا مواجه شد.")
+        return
+
+    await state.clear()
+    await message.answer(
+        f"✅ نام صاحب کارت ذخیره شد: {card_holder_name}",
+        reply_markup=build_admin_menu(),
+    )
+
+
+@router.message(F.text == "🔙 بازگشت به منوی ادمین")
+async def back_to_admin_menu_handler(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer("به منوی ادمین برگشتید.", reply_markup=build_admin_menu())
 
 
 @router.message(F.text == "🔙 بازگشت به منوی اصلی")
@@ -934,6 +929,15 @@ async def admin_add_config_field_handler(message: Message, state: FSMContext, db
             await message.answer("⚠️ مدت نمی‌تواند خالی باشد.")
             return
         payload["duration"] = value
+        await state.update_data(add_step="speed", add_payload=payload)
+        await message.answer("سرعت سرویس را ارسال کنید (مثال: 100Mbps):")
+        return
+
+    if step == "speed":
+        if not value:
+            await message.answer("⚠️ سرعت نمی‌تواند خالی باشد.")
+            return
+        payload["speed"] = value
         await state.update_data(add_step="description", add_payload=payload)
         await message.answer("توضیحات را ارسال کنید:")
         return
@@ -955,33 +959,52 @@ async def admin_add_config_field_handler(message: Message, state: FSMContext, db
             await message.answer("⚠️ مقدار موجودی نمی‌تواند کمتر از -1 باشد.")
             return
         payload["stock"] = stock
-        await state.update_data(add_step="config_content", add_payload=payload)
-        await message.answer("متن کانفیگ را ارسال کنید:")
+        await state.update_data(
+            add_step="collect_items",
+            add_payload=payload,
+            collected_items=[],
+            collect_index=1,
+        )
+        markup = build_finish_collecting_keyboard() if stock == -1 else None
+        await message.answer("📥 لطفاً متن کانفیگ 1 را ارسال کنید", reply_markup=markup)
         return
 
-    if step == "config_content":
+    if step == "collect_items":
         if not value:
             await message.answer("⚠️ متن کانفیگ نمی‌تواند خالی باشد.")
             return
-        payload["config_content"] = value
-        model_name = _model_title(model)
-        stock_text = _stock_text(int(payload["stock"]))
+        collected_items = list(state_data.get("collected_items", []))
+        collected_items.append(value)
+        payload_stock = int(payload.get("stock", 0))
+        next_index = len(collected_items) + 1
+        await state.update_data(collected_items=collected_items, collect_index=next_index)
 
-        builder = InlineKeyboardBuilder()
-        builder.row(InlineKeyboardButton(text="تأیید", callback_data="admin_confirm_add_config"))
-        builder.row(InlineKeyboardButton(text="انصراف", callback_data="admin_cancel_add_config"))
+        if payload_stock > 0 and len(collected_items) >= payload_stock:
+            try:
+                await db.add_model_config_with_items(
+                    model=str(model),
+                    title=str(payload["title"]),
+                    price=int(payload["price"]),
+                    duration=str(payload["duration"]),
+                    speed=str(payload["speed"]),
+                    description=str(payload["description"]),
+                    stock=payload_stock,
+                    config_items=collected_items,
+                )
+            except Exception:
+                logger.exception("Saving limited config batch failed for model=%s", model)
+                await message.answer("❌ ثبت کانفیگ با خطا مواجه شد.")
+                return
+            await state.clear()
+            await message.answer(
+                f"✅ کانفیگ با موفقیت ثبت شد\n📦 تعداد کانفیگ‌ها: {len(collected_items)}",
+            )
+            await _send_admin_model_page(message, db, model=str(model), page=1)
+            return
 
-        await state.update_data(add_step="confirm", add_payload=payload)
         await message.answer(
-            "پیش‌نمایش کانفیگ جدید:\n"
-            f"مدل: {model_name}\n"
-            f"عنوان: {payload['title']}\n"
-            f"قیمت: {payload['price']:,} تومان\n"
-            f"مدت: {payload['duration']}\n"
-            f"توضیحات: {payload['description']}\n"
-            f"موجودی: {stock_text}\n\n"
-            f"متن کانفیگ:\n{payload['config_content']}".replace(",", "٬"),
-            reply_markup=builder.as_markup(),
+            f"✅ ثبت شد\n📥 لطفاً متن کانفیگ {next_index} را ارسال کنید",
+            reply_markup=build_finish_collecting_keyboard() if payload_stock == -1 else None,
         )
         return
 
@@ -1000,33 +1023,55 @@ async def admin_confirm_add_config_handler(
     db: DatabaseHandler,
 ) -> None:
     await callback.answer()
+    await callback.message.answer("⚠️ این مرحله غیرفعال شده است. لطفاً متن کانفیگ‌ها را ارسال کنید.")
+
+
+@router.callback_query(F.data == "admin_finish_collecting_configs")
+async def admin_finish_collecting_configs_handler(
+    callback: CallbackQuery,
+    state: FSMContext,
+    db: DatabaseHandler,
+) -> None:
+    await callback.answer()
     state_data = await state.get_data()
-    model = state_data.get("selected_model")
-    payload = state_data.get("add_payload", {})
-    required = {"title", "price", "duration", "description", "stock", "config_content"}
-    if model not in {"nox_plus", "nox_multi"} or not required.issubset(payload.keys()):
-        await state.clear()
-        await callback.message.answer("⚠️ اطلاعات کافی برای ثبت کانفیگ موجود نیست.")
+    if await state.get_state() != AdminServiceStates.adding_config_field.state:
+        await callback.message.answer("⚠️ عملیات فعالی برای افزودن کانفیگ وجود ندارد.")
         return
 
+    model = state_data.get("selected_model")
+    step = state_data.get("add_step")
+    payload = dict(state_data.get("add_payload", {}))
+    collected_items = list(state_data.get("collected_items", []))
+    if model not in {"nox_plus", "nox_multi"} or step != "collect_items":
+        await callback.message.answer("⚠️ این دکمه در این مرحله قابل استفاده نیست.")
+        return
+
+    if len(collected_items) == 0:
+        await callback.message.answer("⚠️ هنوز هیچ متن کانفیگی دریافت نشده است.")
+        return
+
+    final_stock = len(collected_items) if int(payload.get("stock", 0)) == -1 else int(payload.get("stock", 0))
     try:
-        await db.add_model_config(
-            model=model,
+        await db.add_model_config_with_items(
+            model=str(model),
             title=str(payload["title"]),
             price=int(payload["price"]),
             duration=str(payload["duration"]),
+            speed=str(payload["speed"]),
             description=str(payload["description"]),
-            stock=int(payload["stock"]),
-            config_content=str(payload["config_content"]),
+            stock=final_stock,
+            config_items=collected_items,
         )
     except Exception:
-        logger.exception("Adding model config failed for model=%s", model)
+        logger.exception("Saving collected config items failed for model=%s", model)
         await callback.message.answer("❌ ثبت کانفیگ با خطا مواجه شد.")
         return
 
     await state.clear()
-    await callback.message.answer("✅ کانفیگ جدید با موفقیت ثبت شد.")
-    await _send_admin_model_page(callback.message, db, model=model, page=1)
+    await callback.message.answer(
+        f"✅ کانفیگ با موفقیت ثبت شد\n📦 تعداد کانفیگ‌های ثبت‌شده: {len(collected_items)}"
+    )
+    await _send_admin_model_page(callback.message, db, model=str(model), page=1)
 
 
 @router.callback_query(F.data.startswith("admin_edit_config:"))
@@ -1050,7 +1095,7 @@ async def admin_edit_field_handler(callback: CallbackQuery, state: FSMContext) -
         return
     config_id = int(parts[1])
     field = parts[2]
-    if field not in {"title", "price", "duration", "description", "stock", "config_content"}:
+    if field not in {"title", "price", "duration", "speed", "description", "stock", "config_content"}:
         await callback.message.answer("⚠️ فیلد نامعتبر است.")
         return
     await state.set_state(AdminServiceStates.editing_config_field)

@@ -2,11 +2,8 @@ from aiogram.fsm.state import State, StatesGroup
 
 
 class RechargeStates(StatesGroup):
+    waiting_amount = State()
     waiting_for_receipt = State()
-
-
-class AdminRechargeStates(StatesGroup):
-    waiting_for_amount = State()
 
 
 class AdminPriceStates(StatesGroup):
@@ -17,6 +14,7 @@ class AdminPriceStates(StatesGroup):
 class AdminStates(StatesGroup):
     waiting_for_broadcast_message = State()
     waiting_for_card_number = State()
+    waiting_for_card_holder_name = State()
     waiting_for_add_config_category = State()
     waiting_for_config_list = State()
 
