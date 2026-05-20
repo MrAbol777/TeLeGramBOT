@@ -33,6 +33,182 @@ def format_toman(amount: int) -> str:
     return f"{amount:,}".replace(",", "٬")
 
 
+RECHARGE_PAGE_SIZE = 5
+
+
+def _format_recharge_status(status: str) -> str:
+    return {
+        "pending": "🟡 pending",
+        "approved": "✅ approved",
+        "rejected": "❌ rejected",
+    }.get(status, status)
+
+
+def build_recharge_requests_keyboard(
+    status: str,
+    page: int,
+    total_pages: int,
+    request_ids: list[int],
+    user_id: int | None = None,
+    username: str | None = None,
+) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    filters = [
+        ("همه", "all"),
+        ("pending", "pending"),
+        ("approved", "approved"),
+        ("rejected", "rejected"),
+    ]
+    for text, value in filters:
+        prefix = "✅ " if status == value else ""
+        builder.button(
+            text=f"{prefix}{text}",
+            callback_data=(
+                f"recharge_admin_list:status={value}:page=1"
+                f":uid={user_id or ''}:uname={username or ''}"
+            ),
+        )
+    builder.adjust(4)
+    builder.row(
+        InlineKeyboardButton(
+            text="🔎 جستجو user_id",
+            callback_data=f"recharge_admin_search:user_id:status={status}",
+        ),
+        InlineKeyboardButton(
+            text="🔎 جستجو username",
+            callback_data=f"recharge_admin_search:username:status={status}",
+        ),
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text="🧹 حذف جستجو",
+            callback_data=f"recharge_admin_list:status={status}:page=1:uid=:uname=",
+        )
+    )
+    for request_id in request_ids:
+        builder.row(
+            InlineKeyboardButton(
+                text=f"📄 جزئیات درخواست #{request_id}",
+                callback_data=(
+                    f"recharge_admin_open:{request_id}:status={status}:page={page}"
+                    f":uid={user_id or ''}:uname={username or ''}"
+                ),
+            )
+        )
+
+    nav_buttons: list[InlineKeyboardButton] = []
+    if page > 1:
+        nav_buttons.append(
+            InlineKeyboardButton(
+                text="⬅️ قبلی",
+                callback_data=(
+                    f"recharge_admin_list:status={status}:page={page-1}"
+                    f":uid={user_id or ''}:uname={username or ''}"
+                ),
+            )
+        )
+    nav_buttons.append(InlineKeyboardButton(text=f"{page}/{total_pages}", callback_data="admin_noop"))
+    if page < total_pages:
+        nav_buttons.append(
+            InlineKeyboardButton(
+                text="➡️ بعدی",
+                callback_data=(
+                    f"recharge_admin_list:status={status}:page={page+1}"
+                    f":uid={user_id or ''}:uname={username or ''}"
+                ),
+            )
+        )
+    builder.row(*nav_buttons)
+    builder.row(
+        InlineKeyboardButton(text="📊 گزارش شارژ", callback_data="recharge_admin_report"),
+        InlineKeyboardButton(text="🔙 منوی ادمین", callback_data="admin_back:main_admin_menu"),
+    )
+    return builder.as_markup()
+
+
+def build_recharge_request_details_keyboard(request_id: int, status: str, back_payload: str) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    if status == "pending":
+        builder.row(
+            InlineKeyboardButton(text="✅ تایید", callback_data=f"recharge_admin_approve:{request_id}:{back_payload}"),
+            InlineKeyboardButton(text="⛔ رد", callback_data=f"recharge_admin_reject:{request_id}:{back_payload}"),
+        )
+    builder.row(
+        InlineKeyboardButton(text="⬅️ بازگشت به لیست", callback_data=f"recharge_admin_list:{back_payload}")
+    )
+    return builder.as_markup()
+
+
+def _parse_recharge_list_payload(payload: str) -> tuple[str, int, int | None, str | None]:
+    status = "all"
+    page = 1
+    user_id: int | None = None
+    username: str | None = None
+    for chunk in payload.split(":"):
+        if "=" not in chunk:
+            continue
+        key, value = chunk.split("=", 1)
+        if key == "status" and value in {"all", "pending", "approved", "rejected"}:
+            status = value
+        elif key == "page" and value.isdigit():
+            page = max(1, int(value))
+        elif key == "uid" and value.isdigit():
+            user_id = int(value)
+        elif key == "uname" and value:
+            username = value
+    return status, page, user_id, username
+
+
+async def _send_recharge_requests_page(message: Message, db: DatabaseHandler, payload: str) -> None:
+    status, page, user_id, username = _parse_recharge_list_payload(payload)
+    db_status = None if status == "all" else status
+
+    total = await db.count_recharge_requests(status=db_status, user_id=user_id, username=username)
+    total_pages = max(1, (total + RECHARGE_PAGE_SIZE - 1) // RECHARGE_PAGE_SIZE)
+    safe_page = min(page, total_pages)
+    requests = await db.get_recharge_requests(
+        status=db_status,
+        user_id=user_id,
+        username=username,
+        page=safe_page,
+        limit=RECHARGE_PAGE_SIZE,
+    )
+
+    title = f"📥 درخواست‌های شارژ — {status}"
+    if user_id is not None:
+        title += f" | user_id={user_id}"
+    if username:
+        title += f" | username~{username}"
+
+    lines = [title, ""]
+    if not requests:
+        lines.append("موردی برای نمایش وجود ندارد.")
+    else:
+        for request_id, req_user_id, req_username, amount, _file_id, req_status, created_at in requests:
+            username_text = f"@{req_username}" if req_username else "ندارد"
+            lines.append(
+                f"🧾 ID: {request_id}\n"
+                f"👤 {username_text} (user_id: {req_user_id})\n"
+                f"💰 مبلغ: {format_toman(amount)} تومان\n"
+                f"🕒 ثبت: {created_at}\n"
+                f"📌 وضعیت: {_format_recharge_status(req_status)}"
+            )
+            lines.append("────────────")
+    lines.append(f"صفحه {safe_page} از {total_pages}")
+
+    await message.answer(
+        "\n".join(lines),
+        reply_markup=build_recharge_requests_keyboard(
+            status=status,
+            page=safe_page,
+            total_pages=total_pages,
+            request_ids=[item[0] for item in requests],
+            user_id=user_id,
+            username=username,
+        ),
+    )
+
+
 def build_broadcast_preview_keyboard() -> InlineKeyboardBuilder:
     builder = InlineKeyboardBuilder()
     builder.row(
@@ -456,6 +632,223 @@ async def manage_prices_handler(message: Message, state: FSMContext, db: Databas
     )
 
 
+@router.message(F.text == "📥 درخواست‌های شارژ")
+async def recharge_requests_menu_handler(message: Message, state: FSMContext, db: DatabaseHandler) -> None:
+    await state.clear()
+    try:
+        pending_count = await db.get_pending_recharge_count()
+        await message.answer(f"📥 پنل درخواست‌های شارژ\n🟡 در انتظار بررسی: {pending_count}")
+        await _send_recharge_requests_page(message, db, "status=all:page=1:uid=:uname=")
+    except Exception:
+        logger.exception("Loading recharge requests menu failed")
+        await message.answer("❌ دریافت درخواست‌های شارژ با خطا مواجه شد.")
+
+
+@router.callback_query(F.data.startswith("recharge_admin_list:"))
+async def recharge_admin_list_handler(callback: CallbackQuery, state: FSMContext, db: DatabaseHandler) -> None:
+    await callback.answer()
+    await state.clear()
+    payload = callback.data.split("recharge_admin_list:", 1)[1]
+    try:
+        await _send_recharge_requests_page(callback.message, db, payload)
+    except Exception:
+        logger.exception("Loading recharge list callback failed payload=%s", payload)
+        await callback.message.answer("❌ دریافت لیست درخواست‌ها با خطا مواجه شد.")
+
+
+@router.callback_query(F.data.startswith("recharge_admin_search:"))
+async def recharge_admin_search_start_handler(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    parts = callback.data.split(":")
+    if len(parts) < 3:
+        await callback.message.answer("⚠️ درخواست جستجو نامعتبر است.")
+        return
+    search_type = parts[1]
+    status = "all"
+    if "=" in parts[2]:
+        key, value = parts[2].split("=", 1)
+        if key == "status" and value in {"all", "pending", "approved", "rejected"}:
+            status = value
+
+    await state.update_data(recharge_search_status=status)
+    if search_type == "user_id":
+        await state.set_state(AdminStates.waiting_recharge_search_user_id)
+        await callback.message.answer("🔎 user_id را ارسال کنید:")
+        return
+    if search_type == "username":
+        await state.set_state(AdminStates.waiting_recharge_search_username)
+        await callback.message.answer("🔎 username را بدون @ ارسال کنید:")
+        return
+    await callback.message.answer("⚠️ نوع جستجو نامعتبر است.")
+
+
+@router.message(AdminStates.waiting_recharge_search_user_id, F.text)
+async def recharge_search_user_id_handler(message: Message, state: FSMContext, db: DatabaseHandler) -> None:
+    raw_user_id = message.text.strip()
+    if not raw_user_id.isdigit():
+        await message.answer("⚠️ user_id باید عددی باشد.")
+        return
+    state_data = await state.get_data()
+    status = state_data.get("recharge_search_status", "all")
+    await state.clear()
+    payload = f"status={status}:page=1:uid={int(raw_user_id)}:uname="
+    await _send_recharge_requests_page(message, db, payload)
+
+
+@router.message(AdminStates.waiting_recharge_search_username, F.text)
+async def recharge_search_username_handler(message: Message, state: FSMContext, db: DatabaseHandler) -> None:
+    username = message.text.strip().lstrip("@")
+    if len(username) < 2:
+        await message.answer("⚠️ username معتبر نیست.")
+        return
+    state_data = await state.get_data()
+    status = state_data.get("recharge_search_status", "all")
+    await state.clear()
+    payload = f"status={status}:page=1:uid=:uname={username}"
+    await _send_recharge_requests_page(message, db, payload)
+
+
+@router.callback_query(F.data.startswith("recharge_admin_open:"))
+async def recharge_admin_open_handler(callback: CallbackQuery, db: DatabaseHandler, bot: Bot) -> None:
+    await callback.answer()
+    parts = callback.data.split(":", 2)
+    if len(parts) != 3 or not parts[1].isdigit():
+        await callback.message.answer("⚠️ شناسه درخواست نامعتبر است.")
+        return
+    request_id = int(parts[1])
+    back_payload = parts[2]
+
+    request = await db.get_recharge_request(request_id)
+    if not request:
+        await callback.message.answer("⚠️ درخواست شارژ پیدا نشد.")
+        return
+
+    _id, user_id, username, amount, receipt_file_id, status, created_at = request
+    username_text = f"@{username}" if username else "ندارد"
+    caption = (
+        "📄 جزئیات درخواست شارژ\n\n"
+        f"🧾 ID: {request_id}\n"
+        f"👤 کاربر: {username_text}\n"
+        f"🆔 user_id: {user_id}\n"
+        f"💰 مبلغ: {format_toman(amount)} تومان\n"
+        f"📌 وضعیت: {_format_recharge_status(status)}\n"
+        f"🕒 تاریخ ثبت: {created_at}"
+    )
+    keyboard = build_recharge_request_details_keyboard(request_id, status, back_payload)
+
+    if receipt_file_id:
+        try:
+            await callback.message.answer_photo(photo=receipt_file_id, caption=caption, reply_markup=keyboard)
+            return
+        except Exception:
+            logger.exception("Sending receipt photo failed for request_id=%s", request_id)
+    await callback.message.answer(
+        caption + "\n\n⚠️ نمایش تصویر رسید ممکن نبود.",
+        reply_markup=keyboard,
+    )
+
+
+@router.callback_query(F.data.startswith("recharge_admin_approve:"))
+async def recharge_admin_approve_handler(callback: CallbackQuery, db: DatabaseHandler, bot: Bot) -> None:
+    await callback.answer()
+    parts = callback.data.split(":", 2)
+    if len(parts) != 3 or not parts[1].isdigit():
+        await callback.message.answer("⚠️ شناسه درخواست نامعتبر است.")
+        return
+    request_id = int(parts[1])
+    back_payload = parts[2]
+
+    try:
+        approved, user_id, amount = await db.approve_recharge_request(request_id)
+    except Exception:
+        logger.exception("Approving recharge from admin panel failed request_id=%s", request_id)
+        await callback.message.answer("❌ تایید درخواست با خطا مواجه شد.")
+        return
+
+    if not approved:
+        await callback.message.answer("⚠️ این درخواست قبلاً بررسی شده است یا وجود ندارد.")
+        return
+
+    new_balance = await db.get_user_balance(int(user_id))
+    await bot.send_message(
+        int(user_id),
+        "✅ شارژ حساب شما تایید شد\n\n"
+        f"💰 مبلغ شارژ: {format_toman(int(amount))} تومان\n"
+        f"👛 موجودی جدید: {format_toman(new_balance)} تومان",
+    )
+    await callback.message.answer(f"✅ درخواست #{request_id} تایید شد.")
+    await _send_recharge_requests_page(callback.message, db, back_payload)
+
+
+@router.callback_query(F.data.startswith("recharge_admin_reject:"))
+async def recharge_admin_reject_handler(callback: CallbackQuery, db: DatabaseHandler, bot: Bot) -> None:
+    await callback.answer()
+    parts = callback.data.split(":", 2)
+    if len(parts) != 3 or not parts[1].isdigit():
+        await callback.message.answer("⚠️ شناسه درخواست نامعتبر است.")
+        return
+    request_id = int(parts[1])
+    back_payload = parts[2]
+
+    try:
+        rejected, user_id = await db.reject_recharge_request(request_id)
+    except Exception:
+        logger.exception("Rejecting recharge from admin panel failed request_id=%s", request_id)
+        await callback.message.answer("❌ رد درخواست با خطا مواجه شد.")
+        return
+
+    if not rejected:
+        await callback.message.answer("⚠️ این درخواست قبلاً بررسی شده است یا وجود ندارد.")
+        return
+
+    await bot.send_message(
+        int(user_id),
+        "❌ درخواست شارژ شما رد شد.\n\n"
+        "در صورت بروز مشکل با پشتیبانی تماس بگیرید.",
+    )
+    await callback.message.answer(f"⛔ درخواست #{request_id} رد شد.")
+    await _send_recharge_requests_page(callback.message, db, back_payload)
+
+
+@router.message(F.text == "📊 گزارش شارژ")
+async def recharge_report_handler(message: Message, db: DatabaseHandler) -> None:
+    try:
+        stats = await db.get_recharge_stats_today_and_total()
+        latest_requests = await db.get_recharge_requests(status=None, page=1, limit=5)
+    except Exception:
+        logger.exception("Loading recharge report failed")
+        await message.answer("❌ دریافت گزارش شارژ با خطا مواجه شد.")
+        return
+
+    lines = [
+        "📊 گزارش شارژ",
+        "",
+        f"امروز: {stats.get('today_count', 0)} درخواست | مجموع: {format_toman(stats.get('today_amount', 0))} تومان",
+        f"کلی: {stats.get('total_count', 0)} درخواست | مجموع: {format_toman(stats.get('total_amount', 0))} تومان",
+        "",
+        "آخرین درخواست‌ها:",
+    ]
+    if latest_requests:
+        for request_id, user_id, username, amount, _file_id, status, _created_at in latest_requests:
+            username_text = f"@{username}" if username else str(user_id)
+            lines.append(
+                f"• #{request_id} | {username_text} | {format_toman(amount)} | {_format_recharge_status(status)}"
+            )
+    else:
+        lines.append("موردی ثبت نشده است.")
+
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="📥 مشاهده درخواست‌ها", callback_data="recharge_admin_list:status=all:page=1:uid=:uname="))
+    builder.row(InlineKeyboardButton(text="🔙 منوی ادمین", callback_data="admin_back:main_admin_menu"))
+    await message.answer("\n".join(lines), reply_markup=builder.as_markup())
+
+
+@router.callback_query(F.data == "recharge_admin_report")
+async def recharge_report_callback_handler(callback: CallbackQuery, db: DatabaseHandler) -> None:
+    await callback.answer()
+    await recharge_report_handler(callback.message, db)
+
+
 @router.message(F.text == "📈 گزارش فروش")
 async def sales_report_handler(message: Message, db: DatabaseHandler) -> None:
     try:
@@ -621,66 +1014,6 @@ async def set_category_price_handler(
         f"✅ قیمت دسته‌بندی {category_name} روی {price:,} تومان تنظیم شد.".replace(",", "٬"),
         reply_markup=build_admin_menu(),
     )
-
-
-@router.callback_query(F.data.startswith("approve_recharge:"))
-async def approve_recharge_handler(callback: CallbackQuery, db: DatabaseHandler, bot: Bot) -> None:
-    await callback.answer()
-    request_id_text = callback.data.split(":", 1)[1]
-    if not request_id_text.isdigit():
-        await callback.message.answer("⚠️ شناسه درخواست نامعتبر است.")
-        return
-    request_id = int(request_id_text)
-
-    try:
-        approved, user_id, amount = await db.approve_recharge_request(request_id)
-    except Exception:
-        logger.exception("Approving recharge request failed request_id=%s", request_id)
-        await callback.message.answer("❌ تایید درخواست با خطا مواجه شد.")
-        return
-
-    if not approved:
-        await callback.message.answer("⚠️ این درخواست قبلاً بررسی شده است یا وجود ندارد.")
-        return
-
-    new_balance = await db.get_user_balance(int(user_id))
-    await bot.send_message(
-        int(user_id),
-        "✅ شارژ حساب شما تایید شد\n\n"
-        f"💰 مبلغ شارژ: {format_toman(int(amount))} تومان\n"
-        f"👛 موجودی جدید: {format_toman(new_balance)} تومان",
-    )
-    await callback.message.answer(
-        f"✅ درخواست #{request_id} تایید شد و مبلغ {format_toman(int(amount))} تومان شارژ شد."
-    )
-
-
-@router.callback_query(F.data.startswith("reject_recharge:"))
-async def reject_recharge_handler(callback: CallbackQuery, db: DatabaseHandler, bot: Bot) -> None:
-    await callback.answer()
-    request_id_text = callback.data.split(":", 1)[1]
-    if not request_id_text.isdigit():
-        await callback.message.answer("⚠️ شناسه درخواست نامعتبر است.")
-        return
-    request_id = int(request_id_text)
-
-    try:
-        rejected, user_id = await db.reject_recharge_request(request_id)
-    except Exception:
-        logger.exception("Rejecting recharge request failed request_id=%s", request_id)
-        await callback.message.answer("❌ رد درخواست با خطا مواجه شد.")
-        return
-
-    if not rejected:
-        await callback.message.answer("⚠️ این درخواست قبلاً بررسی شده است یا وجود ندارد.")
-        return
-
-    await bot.send_message(
-        int(user_id),
-        "❌ درخواست شارژ شما رد شد.\n\n"
-        "در صورت بروز مشکل با پشتیبانی تماس بگیرید.",
-    )
-    await callback.message.answer(f"❌ درخواست #{request_id} رد شد.")
 
 
 @router.message(F.text == "📢 ارسال همگانی")

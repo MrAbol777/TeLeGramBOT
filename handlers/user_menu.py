@@ -19,7 +19,6 @@ from keyboards.shop_menu import (
     build_purchase_confirmation_menu,
     build_recharge_prompt_menu,
 )
-from keyboards.purchases_menu import build_user_purchases_keyboard
 from utils.states import RechargeStates
 
 logger = logging.getLogger(__name__)
@@ -43,16 +42,47 @@ def format_toman(amount: int) -> str:
     return f"{amount:,}".replace(",", "٬")
 
 
+def build_my_services_actions_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    recharge_payload = {
+        "text": "تمدید / شارژ",
+        "callback_data": "recharge_wallet",
+        "icon_custom_emoji_id": "5443127283898405358",
+    }
+    back_payload = {
+        "text": "بازگشت",
+        "callback_data": "noop",
+        "icon_custom_emoji_id": "5372926953978341366",
+    }
+    try:
+        recharge_button = InlineKeyboardButton(**recharge_payload)
+    except TypeError:
+        recharge_button = InlineKeyboardButton(
+            text=recharge_payload["text"],
+            callback_data=recharge_payload["callback_data"],
+        )
+    try:
+        back_button = InlineKeyboardButton(**back_payload)
+    except TypeError:
+        back_button = InlineKeyboardButton(
+            text=back_payload["text"],
+            callback_data=back_payload["callback_data"],
+        )
+    builder.row(recharge_button, back_button)
+    return builder.as_markup()
+
+
 def build_receipt_review_keyboard(request_id: int) -> InlineKeyboardBuilder:
     builder = InlineKeyboardBuilder()
+    back_payload = "status=pending:page=1:uid=:uname="
     builder.row(
         InlineKeyboardButton(
             text="تایید ✅",
-            callback_data=f"approve_recharge:{request_id}",
+            callback_data=f"recharge_admin_approve:{request_id}:{back_payload}",
         ),
         InlineKeyboardButton(
             text="رد ❌",
-            callback_data=f"reject_recharge:{request_id}",
+            callback_data=f"recharge_admin_reject:{request_id}:{back_payload}",
         ),
     )
     return builder
@@ -611,21 +641,30 @@ async def my_services_handler(callback: CallbackQuery, db: DatabaseHandler) -> N
 
     user_id = callback.from_user.id
     try:
-        purchases = await db.get_user_purchases(user_id)
+        services = await db.get_user_active_services(user_id)
     except Exception:
-        logger.exception("Fetching user purchases failed for user_id=%s", user_id)
+        logger.exception("Fetching active services failed for user_id=%s", user_id)
         await callback.message.answer("❌ دریافت سرویس‌های شما با خطا مواجه شد.")
         return
 
-    if not purchases:
-        await callback.message.answer("📂 هنوز سرویسی خریداری نکرده‌اید.")
+    if not services:
+        await callback.message.answer(
+            "<tg-emoji emoji-id='5411438796651262830'>📭</tg-emoji> سرویسی موجود نیست",
+            reply_markup=build_my_services_actions_keyboard(),
+        )
         return
 
-    latest_purchases = purchases[:15]
+    lines = [f"<tg-emoji emoji-id='5334882760735598374'>📝</tg-emoji> تعداد کل سرویس‌ها: {len(services)}", ""]
+    for index, (_config_id, service_name, config_link, expires_at) in enumerate(services[:15], start=1):
+        lines.append(f"{index}) {html.escape(service_name)}")
+        lines.append(f"⏳ انقضا: {html.escape(expires_at)}")
+        lines.append(f"<code>{html.escape(config_link)}</code>")
+        lines.append("")
+
     await callback.message.answer(
-        "📂 سرویس‌های خریداری‌شده شما:\n"
-        "برای مشاهده جزئیات هر سرویس، روی دکمه همان خرید بزنید.",
-        reply_markup=build_user_purchases_keyboard(latest_purchases),
+        "\n".join(lines).strip(),
+        parse_mode="HTML",
+        reply_markup=build_my_services_actions_keyboard(),
     )
 
 

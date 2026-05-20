@@ -4,17 +4,14 @@ from aiogram.types import KeyboardButton, ReplyKeyboardMarkup
 def build_admin_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="➕ افزودن کانفیگ")],
+            [KeyboardButton(text="مدیریت سرویس‌ها")],
             [KeyboardButton(text="📊 آمار موجودی")],
             [KeyboardButton(text="📊 آمار کلی")],
-            [KeyboardButton(text="📈 گزارش فروش")],
             [KeyboardButton(text="📊 گزارش فروش")],
-            [KeyboardButton(text="📢 ارسال همگانی")],
             [KeyboardButton(text="💳 مدیریت پرداخت")],
-            [KeyboardButton(text="➕ افزودن کانفیگ جدید")],
-            [KeyboardButton(text="💰 مدیریت قیمت‌ها")],
-            [KeyboardButton(text="مدیریت سرویس‌ها")],
-            [KeyboardButton(text="🔙 بازگشت به منوی اصلی")],
+            [KeyboardButton(text="📢 ارسال همگانی")],
+            [KeyboardButton(text="📥 درخواست‌های شارژ")],
+            [KeyboardButton(text="📊 گزارش شارژ")],
         ],
         resize_keyboard=True,
     )

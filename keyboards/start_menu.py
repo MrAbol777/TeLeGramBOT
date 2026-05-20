@@ -50,8 +50,9 @@ def build_start_menu() -> InlineKeyboardMarkup:
             callback_data="recharge_wallet",
         ),
         InlineKeyboardButton(
-            text="📂 سرویس‌های من",
+            text="سرویس‌های من",
             callback_data="my_services",
+            icon_custom_emoji_id="5443127283898405358",
         ),
     )
     return builder.as_markup()

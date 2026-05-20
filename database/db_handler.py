@@ -1,3 +1,6 @@
+import re
+from datetime import datetime, timedelta, timezone
+
 import aiosqlite
 
 
@@ -107,6 +110,18 @@ class DatabaseHandler:
                 """
                 CREATE INDEX IF NOT EXISTS idx_transactions_user_time
                 ON transactions(user_id, timestamp)
+                """
+            )
+            await db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_recharge_requests_status_created
+                ON recharge_requests(status, created_at DESC)
+                """
+            )
+            await db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_recharge_requests_user
+                ON recharge_requests(user_id)
                 """
             )
 
@@ -407,6 +422,109 @@ class DatabaseHandler:
                 await db.rollback()
                 raise
 
+    async def get_recharge_requests(
+        self,
+        status: str | None = None,
+        user_id: int | None = None,
+        username: str | None = None,
+        page: int = 1,
+        limit: int = 10,
+    ) -> list[tuple[int, int, str | None, int, str, str, str]]:
+        filters: list[str] = []
+        params: list[object] = []
+        if status and status in {"pending", "approved", "rejected"}:
+            filters.append("status = ?")
+            params.append(status)
+        if user_id is not None:
+            filters.append("user_id = ?")
+            params.append(user_id)
+        if username:
+            filters.append("lower(COALESCE(username, '')) LIKE ?")
+            params.append(f"%{username.lower()}%")
+
+        where_sql = f"WHERE {' AND '.join(filters)}" if filters else ""
+        safe_limit = max(1, limit)
+        safe_page = max(1, page)
+        offset = (safe_page - 1) * safe_limit
+
+        query = f"""
+            SELECT id, user_id, username, amount, receipt_file_id, status, created_at
+            FROM recharge_requests
+            {where_sql}
+            ORDER BY datetime(created_at) DESC, id DESC
+            LIMIT ? OFFSET ?
+        """
+        params.extend([safe_limit, offset])
+
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(query, tuple(params)) as cursor:
+                rows = await cursor.fetchall()
+                return [
+                    (
+                        int(row[0]),
+                        int(row[1]),
+                        str(row[2]) if row[2] is not None else None,
+                        int(row[3]),
+                        str(row[4]),
+                        str(row[5]),
+                        str(row[6]),
+                    )
+                    for row in rows
+                ]
+
+    async def count_recharge_requests(
+        self,
+        status: str | None = None,
+        user_id: int | None = None,
+        username: str | None = None,
+    ) -> int:
+        filters: list[str] = []
+        params: list[object] = []
+        if status and status in {"pending", "approved", "rejected"}:
+            filters.append("status = ?")
+            params.append(status)
+        if user_id is not None:
+            filters.append("user_id = ?")
+            params.append(user_id)
+        if username:
+            filters.append("lower(COALESCE(username, '')) LIKE ?")
+            params.append(f"%{username.lower()}%")
+
+        where_sql = f"WHERE {' AND '.join(filters)}" if filters else ""
+        query = f"SELECT COUNT(*) FROM recharge_requests {where_sql}"
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(query, tuple(params)) as cursor:
+                row = await cursor.fetchone()
+                return int(row[0]) if row else 0
+
+    async def get_pending_recharge_count(self) -> int:
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                "SELECT COUNT(*) FROM recharge_requests WHERE status = 'pending'"
+            ) as cursor:
+                row = await cursor.fetchone()
+                return int(row[0]) if row else 0
+
+    async def get_recharge_stats_today_and_total(self) -> dict[str, int]:
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                """
+                SELECT
+                    COALESCE(SUM(CASE WHEN status = 'approved' AND date(created_at) = date('now') THEN amount ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN status = 'approved' AND date(created_at) = date('now') THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN status = 'approved' THEN amount ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END), 0)
+                FROM recharge_requests
+                """
+            ) as cursor:
+                row = await cursor.fetchone()
+                return {
+                    "today_amount": int(row[0]) if row else 0,
+                    "today_count": int(row[1]) if row else 0,
+                    "total_amount": int(row[2]) if row else 0,
+                    "total_count": int(row[3]) if row else 0,
+                }
+
     async def add_user_if_not_exists(self, user_id: int) -> None:
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute(
@@ -627,6 +745,65 @@ class DatabaseHandler:
                 (user_id,),
             ) as cursor:
                 return await cursor.fetchall()
+
+    @staticmethod
+    def _extract_duration_days(duration: str) -> int | None:
+        normalized = (duration or "").strip().lower()
+        if not normalized:
+            return None
+        match = re.search(r"(\d+)", normalized)
+        if not match:
+            return None
+        value = int(match.group(1))
+        if "ماه" in normalized:
+            return value * 30
+        if "سال" in normalized:
+            return value * 365
+        return value
+
+    async def get_user_active_services(
+        self,
+        user_id: int,
+    ) -> list[tuple[int, str, str, str]]:
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                """
+                SELECT id, title, category, config_content, duration, sold_at
+                FROM configs
+                WHERE is_sold = 1 AND sold_to = ?
+                ORDER BY sold_at DESC, id DESC
+                """,
+                (user_id,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+
+        now = datetime.now(timezone.utc)
+        services: list[tuple[int, str, str, str]] = []
+        for row in rows:
+            config_id = int(row[0])
+            title = str(row[1] or row[2] or "سرویس")
+            config_content = str(row[3] or "")
+            duration_text = str(row[4] or "")
+            sold_at_text = str(row[5] or "")
+
+            expires_at = "نامشخص"
+            days = self._extract_duration_days(duration_text)
+            sold_at_dt: datetime | None = None
+            if sold_at_text:
+                try:
+                    sold_at_dt = datetime.fromisoformat(sold_at_text.replace(" ", "T")).replace(
+                        tzinfo=timezone.utc
+                    )
+                except ValueError:
+                    sold_at_dt = None
+            if sold_at_dt and days is not None and days > 0:
+                expiry_dt = sold_at_dt + timedelta(days=days)
+                if expiry_dt < now:
+                    continue
+                expires_at = expiry_dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+            services.append((config_id, title, config_content, expires_at))
+        return services
 
     async def get_admin_stats(self) -> dict[str, int]:
         async with aiosqlite.connect(self.db_path) as db:

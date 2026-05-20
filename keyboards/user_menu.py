@@ -34,7 +34,11 @@ def build_main_menu() -> InlineKeyboardMarkup:
         buy_service_button,
         account_button,
         InlineKeyboardButton(text="💳 شارژ حساب", callback_data="recharge_wallet"),
-        InlineKeyboardButton(text="📂 سرویس‌های من", callback_data="my_services"),
+        InlineKeyboardButton(
+            text="سرویس‌های من",
+            callback_data="my_services",
+            icon_custom_emoji_id="5443127283898405358",
+        ),
         InlineKeyboardButton(text="👥 زیرمجموعه‌گیری", callback_data="referral_info"),
         InlineKeyboardButton(text="📚 راهنمای اتصال", callback_data="connection_guide"),
         InlineKeyboardButton(text="👨‍💻 پشتیبانی", callback_data="support"),

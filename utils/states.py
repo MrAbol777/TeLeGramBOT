@@ -15,6 +15,8 @@ class AdminStates(StatesGroup):
     waiting_for_broadcast_message = State()
     waiting_for_card_number = State()
     waiting_for_card_holder_name = State()
+    waiting_recharge_search_user_id = State()
+    waiting_recharge_search_username = State()
     waiting_for_add_config_category = State()
     waiting_for_config_list = State()
 
