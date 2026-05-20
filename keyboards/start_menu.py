@@ -46,8 +46,9 @@ def build_start_menu() -> InlineKeyboardMarkup:
     )
     builder.row(
         InlineKeyboardButton(
-            text="💳 شارژ حساب",
+            text="شارژ حساب",
             callback_data="recharge_wallet",
+            icon_custom_emoji_id="5868268899480375540",
         ),
         InlineKeyboardButton(
             text="سرویس‌های من",

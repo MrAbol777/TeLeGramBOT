@@ -33,7 +33,11 @@ def build_main_menu() -> InlineKeyboardMarkup:
     builder.add(
         buy_service_button,
         account_button,
-        InlineKeyboardButton(text="💳 شارژ حساب", callback_data="recharge_wallet"),
+        InlineKeyboardButton(
+            text="شارژ حساب",
+            callback_data="recharge_wallet",
+            icon_custom_emoji_id="5868268899480375540",
+        ),
         InlineKeyboardButton(
             text="سرویس‌های من",
             callback_data="my_services",
@@ -44,4 +48,39 @@ def build_main_menu() -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="👨‍💻 پشتیبانی", callback_data="support"),
     )
     builder.adjust(2)
+    return builder.as_markup()
+
+
+def build_recharge_method_menu() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+
+    crypto_payload = {
+        "text": "پرداخت ارزی",
+        "callback_data": "recharge_method_crypto",
+        "icon_custom_emoji_id": "5402186569006210455",
+    }
+    card_payload = {
+        "text": "کارت به کارت",
+        "callback_data": "recharge_method_card",
+        "icon_custom_emoji_id": "5204242830687494041",
+    }
+
+    try:
+        crypto_button = InlineKeyboardButton(**crypto_payload)
+    except TypeError:
+        crypto_button = InlineKeyboardButton(
+            text=crypto_payload["text"],
+            callback_data=crypto_payload["callback_data"],
+        )
+
+    try:
+        card_button = InlineKeyboardButton(**card_payload)
+    except TypeError:
+        card_button = InlineKeyboardButton(
+            text=card_payload["text"],
+            callback_data=card_payload["callback_data"],
+        )
+
+    builder.row(crypto_button)
+    builder.row(card_button)
     return builder.as_markup()

@@ -256,6 +256,9 @@ class DatabaseHandler:
             )
             await db.commit()
 
+    async def update_setting(self, key: str, value: str) -> None:
+        await self.set_setting(key, value)
+
     async def get_payment_settings(self) -> tuple[str, str]:
         async with aiosqlite.connect(self.db_path) as db:
             async with db.execute(
@@ -340,7 +343,11 @@ class DatabaseHandler:
                     str(row[6]),
                 )
 
-    async def approve_recharge_request(self, request_id: int) -> tuple[bool, int | None, int | None]:
+    async def approve_recharge_request(
+        self,
+        request_id: int,
+        approved_amount: int | None = None,
+    ) -> tuple[bool, int | None, int | None]:
         async with aiosqlite.connect(self.db_path) as db:
             try:
                 await db.execute("BEGIN IMMEDIATE")
@@ -354,11 +361,16 @@ class DatabaseHandler:
                     return False, None, None
 
                 user_id = int(row[0])
-                amount = int(row[1])
+                request_amount = int(row[1])
                 status = str(row[2] or "")
                 if status != "pending":
                     await db.rollback()
-                    return False, user_id, amount
+                    return False, user_id, request_amount
+
+                amount = int(approved_amount) if approved_amount is not None else request_amount
+                if amount <= 0:
+                    await db.rollback()
+                    return False, user_id, request_amount
 
                 await db.execute(
                     "INSERT OR IGNORE INTO users (user_id) VALUES (?)",
@@ -371,10 +383,10 @@ class DatabaseHandler:
                 await db.execute(
                     """
                     UPDATE recharge_requests
-                    SET status = 'approved'
+                    SET status = 'approved', amount = ?
                     WHERE id = ? AND status = 'pending'
                     """,
-                    (request_id,),
+                    (amount, request_id),
                 )
                 await db.execute(
                     """

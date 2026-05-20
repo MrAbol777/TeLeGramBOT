@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import logging
 
 from aiogram import Bot, F, Router
@@ -18,9 +19,8 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 from config import settings
 from database.db_handler import DatabaseHandler
 from keyboards.admin_menu import build_admin_menu
-from keyboards.shop_menu import build_admin_category_price_menu
 from keyboards.start_menu import build_start_menu
-from utils.states import AdminPriceStates, AdminServiceStates, AdminStates
+from utils.states import AdminServiceStates, AdminStates
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +34,12 @@ def format_toman(amount: int) -> str:
 
 
 RECHARGE_PAGE_SIZE = 5
+CRYPTO_WALLET_KEYS: dict[str, str] = {
+    "crypto_usdt_bep20": "USDT (BEP20)",
+    "crypto_tron_trc20": "TRON (TRC20)",
+    "crypto_ton": "TON",
+}
+CRYPTO_APPROVE_CANCEL_TEXT = "❌ لغو تایید شارژ ارزی"
 
 
 def _format_recharge_status(status: str) -> str:
@@ -233,6 +239,16 @@ def build_cancel_reply_keyboard():
     return builder.as_markup(resize_keyboard=True)
 
 
+def build_crypto_approve_cancel_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text=CRYPTO_APPROVE_CANCEL_TEXT, callback_data="admin_cancel_crypto_approve"))
+    return builder.as_markup()
+
+
+def _is_crypto_recharge_request(amount: int, receipt_file_id: str) -> bool:
+    return amount == 0 or receipt_file_id.startswith("crypto_hash:")
+
+
 def _model_title(model: str) -> str:
     return "Nox Plus" if model == "nox_plus" else "Nox Multi"
 
@@ -343,6 +359,33 @@ def build_finish_collecting_keyboard() -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
+def build_crypto_wallets_manage_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for key, title in CRYPTO_WALLET_KEYS.items():
+        builder.row(
+            InlineKeyboardButton(
+                text=f"✏️ ویرایش {title}",
+                callback_data=f"admin_crypto_wallet_edit:{key}",
+            )
+        )
+    builder.row(InlineKeyboardButton(text="🔙 منوی ادمین", callback_data="admin_back:main_admin_menu"))
+    return builder.as_markup()
+
+
+async def _send_crypto_wallets_manage_panel(message: Message, db: DatabaseHandler) -> None:
+    wallet_usdt = await db.get_setting("crypto_usdt_bep20", "تنظیم نشده")
+    wallet_tron = await db.get_setting("crypto_tron_trc20", "تنظیم نشده")
+    wallet_ton = await db.get_setting("crypto_ton", "تنظیم نشده")
+    await message.answer(
+        "💱 مدیریت ولت‌های ارزی\n\n"
+        f"USDT (BEP20):\n<code>{html.escape(str(wallet_usdt))}</code>\n\n"
+        f"TRON (TRC20):\n<code>{html.escape(str(wallet_tron))}</code>\n\n"
+        f"TON:\n<code>{html.escape(str(wallet_ton))}</code>",
+        parse_mode="HTML",
+        reply_markup=build_crypto_wallets_manage_keyboard(),
+    )
+
+
 async def _send_sales_report(message: Message, db: DatabaseHandler) -> None:
     today_sales = await db.get_today_sales_count()
     today_amount = await db.get_today_sales_amount()
@@ -411,6 +454,13 @@ async def admin_services_root_handler(message: Message, state: FSMContext) -> No
         "مدیریت سرویس‌ها\nیکی از مدل‌ها را انتخاب کنید:",
         reply_markup=build_services_root_keyboard(),
     )
+
+
+@router.message(F.text == "🚪 خروج از پنل مدیریت")
+async def admin_exit_panel_handler(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer("🏠 شما از پنل مدیریت خارج شدید.", reply_markup=ReplyKeyboardRemove())
+    await message.answer("منوی اصلی:", reply_markup=build_start_menu())
 
 
 @router.callback_query(F.data == "admin_services_root")
@@ -612,26 +662,6 @@ async def stock_stats_handler(message: Message, db: DatabaseHandler) -> None:
     await message.answer("\n".join(lines), reply_markup=build_admin_menu())
 
 
-@router.message(F.text == "💰 مدیریت قیمت‌ها")
-async def manage_prices_handler(message: Message, state: FSMContext, db: DatabaseHandler) -> None:
-    try:
-        categories = await db.get_all_categories_with_details()
-    except Exception:
-        logger.exception("Fetching categories for price management failed")
-        await message.answer("❌ دریافت دسته‌بندی‌ها با خطا مواجه شد.")
-        return
-
-    if not categories:
-        await message.answer("📦 هنوز هیچ دسته‌بندی‌ای در انبار ثبت نشده است.")
-        return
-
-    await state.set_state(AdminPriceStates.waiting_for_category_selection)
-    await message.answer(
-        "💰 برای تنظیم قیمت، یکی از دسته‌بندی‌های زیر را انتخاب کنید:",
-        reply_markup=build_admin_category_price_menu(categories),
-    )
-
-
 @router.message(F.text == "📥 درخواست‌های شارژ")
 async def recharge_requests_menu_handler(message: Message, state: FSMContext, db: DatabaseHandler) -> None:
     await state.clear()
@@ -749,7 +779,12 @@ async def recharge_admin_open_handler(callback: CallbackQuery, db: DatabaseHandl
 
 
 @router.callback_query(F.data.startswith("recharge_admin_approve:"))
-async def recharge_admin_approve_handler(callback: CallbackQuery, db: DatabaseHandler, bot: Bot) -> None:
+async def recharge_admin_approve_handler(
+    callback: CallbackQuery,
+    db: DatabaseHandler,
+    bot: Bot,
+    state: FSMContext,
+) -> None:
     await callback.answer()
     parts = callback.data.split(":", 2)
     if len(parts) != 3 or not parts[1].isdigit():
@@ -757,6 +792,28 @@ async def recharge_admin_approve_handler(callback: CallbackQuery, db: DatabaseHa
         return
     request_id = int(parts[1])
     back_payload = parts[2]
+
+    request = await db.get_recharge_request(request_id)
+    if not request:
+        await callback.message.answer("⚠️ درخواست شارژ پیدا نشد.")
+        return
+    _id, _user_id, _username, amount, receipt_file_id, status, _created_at = request
+    if status != "pending":
+        await callback.message.answer("⚠️ این درخواست قبلاً بررسی شده است یا وجود ندارد.")
+        return
+
+    if _is_crypto_recharge_request(amount=amount, receipt_file_id=receipt_file_id):
+        await state.set_state(AdminStates.waiting_for_crypto_approve_amount)
+        await state.update_data(
+            crypto_approve_request_id=request_id,
+            crypto_approve_back_payload=back_payload,
+        )
+        await callback.message.answer(
+            "💱 این درخواست مربوط به شارژ ارزی است.\n"
+            "لطفاً مبلغ نهایی شارژ را به تومان وارد کنید:",
+            reply_markup=build_crypto_approve_cancel_keyboard(),
+        )
+        return
 
     try:
         approved, user_id, amount = await db.approve_recharge_request(request_id)
@@ -810,6 +867,88 @@ async def recharge_admin_reject_handler(callback: CallbackQuery, db: DatabaseHan
     await _send_recharge_requests_page(callback.message, db, back_payload)
 
 
+@router.callback_query(F.data == "admin_cancel_crypto_approve")
+async def cancel_crypto_approve_handler(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    if await state.get_state() != AdminStates.waiting_for_crypto_approve_amount.state:
+        await callback.message.answer("⚠️ عملیات فعالی برای لغو وجود ندارد.")
+        return
+    await state.clear()
+    await callback.message.answer("❌ تایید شارژ ارزی لغو شد.", reply_markup=build_admin_menu())
+
+
+@router.message(F.text == CRYPTO_APPROVE_CANCEL_TEXT, StateFilter(AdminStates.waiting_for_crypto_approve_amount))
+async def cancel_crypto_approve_message_handler(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer("❌ تایید شارژ ارزی لغو شد.", reply_markup=build_admin_menu())
+
+
+@router.message(AdminStates.waiting_for_crypto_approve_amount, F.text)
+async def approve_crypto_recharge_amount_handler(
+    message: Message,
+    state: FSMContext,
+    db: DatabaseHandler,
+    bot: Bot,
+) -> None:
+    raw_amount = message.text.strip().replace("٬", "").replace(",", "")
+    if not raw_amount.isdigit():
+        await message.answer("⚠️ لطفاً مبلغ را فقط به‌صورت عددی وارد کنید.")
+        return
+    approved_amount = int(raw_amount)
+    if approved_amount <= 0:
+        await message.answer("⚠️ مبلغ باید بزرگ‌تر از صفر باشد.")
+        return
+
+    state_data = await state.get_data()
+    request_id = state_data.get("crypto_approve_request_id")
+    back_payload = state_data.get("crypto_approve_back_payload")
+    if not request_id or not back_payload:
+        await state.clear()
+        await message.answer("⚠️ اطلاعات تایید ارزی ناقص است.", reply_markup=build_admin_menu())
+        return
+
+    request = await db.get_recharge_request(int(request_id))
+    if not request:
+        await state.clear()
+        await message.answer("⚠️ درخواست شارژ پیدا نشد.", reply_markup=build_admin_menu())
+        return
+    _id, user_id, _username, amount, receipt_file_id, status, _created_at = request
+    if status != "pending":
+        await state.clear()
+        await message.answer("⚠️ این درخواست دیگر در وضعیت pending نیست.", reply_markup=build_admin_menu())
+        return
+    if not _is_crypto_recharge_request(amount=amount, receipt_file_id=receipt_file_id):
+        await state.clear()
+        await message.answer("⚠️ این درخواست شارژ ارزی نیست.", reply_markup=build_admin_menu())
+        return
+
+    try:
+        approved, approved_user_id, credited_amount = await db.approve_recharge_request(
+            int(request_id),
+            approved_amount=approved_amount,
+        )
+    except Exception:
+        logger.exception("Approving crypto recharge with custom amount failed request_id=%s", request_id)
+        await message.answer("❌ تایید درخواست شارژ ارزی با خطا مواجه شد.")
+        return
+
+    if not approved or approved_user_id is None or credited_amount is None:
+        await state.clear()
+        await message.answer("⚠️ این درخواست قبلاً بررسی شده است یا وجود ندارد.", reply_markup=build_admin_menu())
+        return
+
+    await state.clear()
+    await bot.send_message(
+        int(approved_user_id),
+        "✅ شارژ ارزی حساب شما تایید شد.\n"
+        f"مبلغ {format_toman(int(credited_amount))} تومان به کیف پول شما اضافه شد.",
+    )
+    await message.answer(
+        f"✅ درخواست شارژ ارزی با موفقیت تایید شد و مبلغ {format_toman(int(credited_amount))} تومان به کیف پول کاربر اضافه شد."
+    )
+    await _send_recharge_requests_page(message, db, str(back_payload))
+
+
 @router.message(F.text == "📊 گزارش شارژ")
 async def recharge_report_handler(message: Message, db: DatabaseHandler) -> None:
     try:
@@ -849,30 +988,6 @@ async def recharge_report_callback_handler(callback: CallbackQuery, db: Database
     await recharge_report_handler(callback.message, db)
 
 
-@router.message(F.text == "📈 گزارش فروش")
-async def sales_report_handler(message: Message, db: DatabaseHandler) -> None:
-    try:
-        stats = await db.get_admin_stats()
-    except Exception:
-        logger.exception("Fetching admin stats failed")
-        await message.answer("❌ دریافت گزارش فروش با خطا مواجه شد.")
-        return
-
-    total_income = stats.get("total_sales_amount", 0)
-    total_recharges = stats.get("total_recharges", 0)
-    sales_today = stats.get("sales_today", 0)
-    total_users = stats.get("total_users", 0)
-    await message.answer(
-        "📈 <b>گزارش مالی فروشگاه</b>\n\n"
-        f"💵 <b>کل درآمد فروش:</b> {total_income:,} تومان\n"
-        f"💳 <b>مجموع شارژهای تاییدشده:</b> {total_recharges:,} تومان\n"
-        f"🛒 <b>تعداد فروش امروز (UTC):</b> {sales_today}\n"
-        f"👥 <b>تعداد کل کاربران:</b> {total_users}".replace(",", "٬"),
-        parse_mode="HTML",
-        reply_markup=build_admin_menu(),
-    )
-
-
 @router.message(F.text == "📊 گزارش فروش")
 async def sales_report_from_sales_table_handler(message: Message, db: DatabaseHandler) -> None:
     try:
@@ -880,16 +995,6 @@ async def sales_report_from_sales_table_handler(message: Message, db: DatabaseHa
     except Exception:
         logger.exception("Loading sales report from sales table failed")
         await message.answer("❌ دریافت گزارش فروش با خطا مواجه شد.")
-
-
-@router.callback_query(F.data == "admin_sales_report")
-async def admin_sales_report_callback_handler(callback: CallbackQuery, db: DatabaseHandler) -> None:
-    await callback.answer()
-    try:
-        await _send_sales_report(callback.message, db)
-    except Exception:
-        logger.exception("Loading sales report callback failed")
-        await callback.message.answer("❌ دریافت گزارش فروش با خطا مواجه شد.")
 
 
 @router.callback_query(F.data == "refresh_sales_report")
@@ -920,98 +1025,6 @@ async def admin_overall_stats_handler(message: Message, db: DatabaseHandler) -> 
         f"🔗 کل کاربران دعوتی (رفرال): {stats.get('total_referrals', 0)} نفر\n\n"
         "</blockquote>".replace(",", "٬"),
         parse_mode="HTML",
-        reply_markup=build_admin_menu(),
-    )
-
-
-@router.callback_query(F.data == "admin_stats")
-async def admin_overall_stats_callback_handler(callback: CallbackQuery, db: DatabaseHandler) -> None:
-    await callback.answer()
-    try:
-        stats = await db.get_admin_stats()
-    except Exception:
-        logger.exception("Fetching overall admin stats by callback failed")
-        await callback.message.answer("❌ دریافت آمار کلی با خطا مواجه شد.")
-        return
-
-    await callback.message.answer(
-        "<blockquote>\n\n"
-        "📊 آمار کلی ربات\n\n"
-        f"👥 تعداد کل کاربران: {stats.get('total_users', 0)} نفر\n\n"
-        f"💰 مجموع فروش کل: {stats.get('total_sales_amount', 0):,} تومان\n\n"
-        f"🛒 تعداد کل سفارشات: {stats.get('total_purchases', 0)} عدد\n\n"
-        f"🔗 کل کاربران دعوتی (رفرال): {stats.get('total_referrals', 0)} نفر\n\n"
-        "</blockquote>".replace(",", "٬"),
-        parse_mode="HTML",
-        reply_markup=build_admin_menu(),
-    )
-
-
-@router.callback_query(
-    AdminPriceStates.waiting_for_category_selection,
-    F.data.startswith("admin_price_category:"),
-)
-async def select_price_category_handler(
-    callback: CallbackQuery,
-    state: FSMContext,
-    db: DatabaseHandler,
-) -> None:
-    await callback.answer()
-    category_id = int(callback.data.split(":")[1])
-
-    try:
-        category = await db.get_category_details(category_id)
-    except Exception:
-        logger.exception("Fetching selected category failed for category_id=%s", category_id)
-        await callback.message.answer("❌ اطلاعات دسته‌بندی قابل دریافت نیست.")
-        return
-
-    if category is None:
-        await state.clear()
-        await callback.message.answer("⚠️ این دسته‌بندی دیگر در دسترس نیست.")
-        return
-
-    _, category_name, current_price, stock_count = category
-    await state.set_state(AdminPriceStates.waiting_for_price)
-    await state.update_data(price_category_name=category_name)
-    await callback.message.answer(
-        f"💳 دسته‌بندی: {category_name}\n"
-        f"💰 قیمت فعلی: {current_price:,} تومان\n"
-        f"📦 موجودی فعلی: {stock_count}\n\n"
-        "عدد قیمت جدید را به تومان ارسال کنید.".replace(",", "٬"),
-    )
-
-
-@router.message(AdminPriceStates.waiting_for_price, F.text)
-async def set_category_price_handler(
-    message: Message,
-    state: FSMContext,
-    db: DatabaseHandler,
-) -> None:
-    cleaned_price = message.text.replace("٬", "").replace(",", "").strip()
-    if not cleaned_price.isdigit():
-        await message.answer("⚠️ قیمت باید فقط عدد باشد. مثلاً `50000`", parse_mode="Markdown")
-        return
-
-    state_data = await state.get_data()
-    category_name = state_data.get("price_category_name")
-    if not category_name:
-        await state.clear()
-        await message.answer("⚠️ دسته‌بندی انتخاب‌شده پیدا نشد. دوباره تلاش کنید.")
-        return
-
-    price = int(cleaned_price)
-
-    try:
-        await db.set_category_price(category_name, price)
-    except Exception:
-        logger.exception("Updating category price failed for category=%s", category_name)
-        await message.answer("❌ ذخیره قیمت جدید با خطا مواجه شد.")
-        return
-
-    await state.clear()
-    await message.answer(
-        f"✅ قیمت دسته‌بندی {category_name} روی {price:,} تومان تنظیم شد.".replace(",", "٬"),
         reply_markup=build_admin_menu(),
     )
 
@@ -1123,6 +1136,49 @@ async def payment_management_handler(message: Message, db: DatabaseHandler) -> N
         reply_markup=builder.as_markup(resize_keyboard=True),
     )
 
+
+@router.message(F.text == "💱 مدیریت ولت‌های ارزی")
+async def crypto_wallets_management_handler(message: Message, state: FSMContext, db: DatabaseHandler) -> None:
+    await state.clear()
+    await _send_crypto_wallets_manage_panel(message, db)
+
+
+@router.callback_query(F.data.startswith("admin_crypto_wallet_edit:"))
+async def crypto_wallet_edit_start_handler(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    wallet_key = callback.data.split(":", 1)[1]
+    if wallet_key not in CRYPTO_WALLET_KEYS:
+        await callback.message.answer("⚠️ ولت نامعتبر است.")
+        return
+    await state.set_state(AdminStates.waiting_for_crypto_wallet_value)
+    await state.update_data(crypto_wallet_key=wallet_key)
+    await callback.message.answer(
+        f"آدرس جدید {CRYPTO_WALLET_KEYS[wallet_key]} را ارسال کنید:",
+    )
+
+
+@router.message(AdminStates.waiting_for_crypto_wallet_value, F.text)
+async def set_crypto_wallet_value_handler(message: Message, state: FSMContext, db: DatabaseHandler) -> None:
+    wallet_value = message.text.strip()
+    if len(wallet_value) < 4:
+        await message.answer("⚠️ آدرس ولت معتبر نیست.")
+        return
+    state_data = await state.get_data()
+    wallet_key = state_data.get("crypto_wallet_key")
+    if wallet_key not in CRYPTO_WALLET_KEYS:
+        await state.clear()
+        await message.answer("⚠️ کلید ولت نامعتبر است.", reply_markup=build_admin_menu())
+        return
+    try:
+        await db.update_setting(str(wallet_key), wallet_value)
+    except Exception:
+        logger.exception("Updating crypto wallet failed key=%s", wallet_key)
+        await message.answer("❌ ذخیره آدرس ولت با خطا مواجه شد.")
+        return
+    await state.clear()
+    await message.answer("✅ آدرس ولت با موفقیت ذخیره شد.")
+    await _send_crypto_wallets_manage_panel(message, db)
+
 @router.message(F.text == "ویرایش شماره کارت")
 async def edit_payment_card_start_handler(message: Message, state: FSMContext, db: DatabaseHandler) -> None:
     current_card, _ = await db.get_payment_settings()
@@ -1199,19 +1255,6 @@ async def set_card_holder_name_handler(message: Message, state: FSMContext, db: 
 async def back_to_admin_menu_handler(message: Message, state: FSMContext) -> None:
     await state.clear()
     await message.answer("به منوی ادمین برگشتید.", reply_markup=build_admin_menu())
-
-
-@router.message(F.text == "🔙 بازگشت به منوی اصلی")
-async def back_to_main_menu_handler(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    await message.answer(
-        "به منوی اصلی برگشتید.",
-        reply_markup=ReplyKeyboardRemove(),
-    )
-    await message.answer(
-        "منوی اصلی:",
-        reply_markup=build_start_menu(),
-    )
 
 
 @router.callback_query(F.data.startswith("admin_add_config:"))
@@ -1340,23 +1383,6 @@ async def admin_add_config_field_handler(message: Message, state: FSMContext, db
             reply_markup=build_finish_collecting_keyboard() if payload_stock == -1 else None,
         )
         return
-
-
-@router.callback_query(F.data == "admin_cancel_add_config")
-async def admin_cancel_add_config_handler(callback: CallbackQuery, state: FSMContext) -> None:
-    await callback.answer()
-    await state.clear()
-    await callback.message.answer("❌ افزودن کانفیگ لغو شد.", reply_markup=build_admin_menu())
-
-
-@router.callback_query(F.data == "admin_confirm_add_config")
-async def admin_confirm_add_config_handler(
-    callback: CallbackQuery,
-    state: FSMContext,
-    db: DatabaseHandler,
-) -> None:
-    await callback.answer()
-    await callback.message.answer("⚠️ این مرحله غیرفعال شده است. لطفاً متن کانفیگ‌ها را ارسال کنید.")
 
 
 @router.callback_query(F.data == "admin_finish_collecting_configs")

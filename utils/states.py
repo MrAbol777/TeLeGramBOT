@@ -4,6 +4,7 @@ from aiogram.fsm.state import State, StatesGroup
 class RechargeStates(StatesGroup):
     waiting_amount = State()
     waiting_for_receipt = State()
+    waiting_for_crypto_proof = State()
 
 
 class AdminPriceStates(StatesGroup):
@@ -19,6 +20,8 @@ class AdminStates(StatesGroup):
     waiting_recharge_search_username = State()
     waiting_for_add_config_category = State()
     waiting_for_config_list = State()
+    waiting_for_crypto_wallet_value = State()
+    waiting_for_crypto_approve_amount = State()
 
 
 class AdminServiceStates(StatesGroup):

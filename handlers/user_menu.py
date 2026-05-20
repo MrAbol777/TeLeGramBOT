@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import logging
+import re
 
 from aiogram import Bot, F, Router
 from aiogram.fsm.context import FSMContext
@@ -10,6 +11,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from config import settings
 from database.db_handler import DatabaseHandler
+from keyboards.user_menu import build_recharge_method_menu
 from keyboards.shop_menu import (
     build_model_configs_menu,
     build_insufficient_balance_menu,
@@ -232,17 +234,59 @@ async def recent_purchase_history_handler(
 async def recharge_wallet_handler(
     callback: CallbackQuery,
     state: FSMContext,
-    db: DatabaseHandler,
 ) -> None:
     await callback.answer()
-    await state.set_state(RechargeStates.waiting_amount)
+    await state.clear()
     await callback.message.answer(
-        "💳 شارژ کیف پول\n\n"
+        "💎 روش پرداخت خود رو انتخاب کنید",
+        reply_markup=build_recharge_method_menu(),
+    )
+
+
+async def _start_card_recharge_flow(message: Message, state: FSMContext) -> None:
+    await state.set_state(RechargeStates.waiting_amount)
+    await message.answer(
+        "<tg-emoji emoji-id=\"5445353829304387411\">💳</tg-emoji> شارژ کیف پول\n\n"
         "لطفاً مبلغ مورد نظر خود را به تومان وارد کنید.\n\n"
         "مثال:\n"
         "50000\n"
         "100000\n"
         "250000",
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data == "recharge_method_card")
+async def recharge_method_card_handler(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    await callback.answer()
+    await _start_card_recharge_flow(callback.message, state)
+
+
+def _sanitize_crypto_proof_text(value: str) -> str:
+    clean = re.sub(r"\s+", " ", value or "").strip()
+    return clean[:250]
+
+
+@router.callback_query(F.data == "recharge_method_crypto")
+async def recharge_method_crypto_handler(callback: CallbackQuery, state: FSMContext, db: DatabaseHandler) -> None:
+    await callback.answer()
+    await state.set_state(RechargeStates.waiting_for_crypto_proof)
+    wallet_usdt_bep20 = await db.get_setting("crypto_usdt_bep20", "تنظیم نشده")
+    wallet_tron_trc20 = await db.get_setting("crypto_tron_trc20", "تنظیم نشده")
+    wallet_ton = await db.get_setting("crypto_ton", "تنظیم نشده")
+    await callback.message.answer(
+        "<tg-emoji emoji-id='5255887969880912405'>💚</tg-emoji> • ولتر تتر ( Bep20 )\n\n"
+        f"<code>{html.escape(str(wallet_usdt_bep20))}</code>\n\n"
+        "<tg-emoji emoji-id='5467463745418573549'>❤️</tg-emoji> • ولت ترون ( Trc20 )\n\n"
+        f"<code>{html.escape(str(wallet_tron_trc20))}</code>\n\n"
+        "<tg-emoji emoji-id='5256144821810115779'>💙</tg-emoji> • ولت تون ( Ton )\n\n"
+        f"<code>{html.escape(str(wallet_ton))}</code>\n\n"
+        "<tg-emoji emoji-id='5274099962655816924'>❗️</tg-emoji> • پس از تکمیل تراکنش ( اسکرین شات و هش ) را همینجا ارسال نمایید .\n\n"
+        "<tg-emoji emoji-id='5420323339723881652'>⚠️</tg-emoji> • در صورت عدم ارسال هش یا اسکرین شات ، تراکنش شما تایید نخواهد شد",
+        parse_mode="HTML",
     )
 
 
@@ -263,23 +307,17 @@ async def recharge_amount_handler(message: Message, state: FSMContext, db: Datab
         )
         return
 
-    card_number, card_holder_name = await db.get_payment_settings()
+    card_number, _card_holder_name = await db.get_payment_settings()
     if not card_number:
         card_number = settings.ADMIN_CARD_NUMBER
-    if not card_holder_name:
-        card_holder_name = "تنظیم نشده"
 
     await state.update_data(recharge_amount=amount)
     await state.set_state(RechargeStates.waiting_for_receipt)
     await message.answer(
-        "💳 درخواست شارژ ثبت شد\n\n"
-        f"💰 مبلغ: {format_toman(amount)} تومان\n\n"
-        "لطفاً مبلغ بالا را به کارت زیر واریز کنید:\n\n"
-        "🏦 شماره کارت\n"
-        f"{card_number}\n\n"
-        "👤 به نام\n"
-        f"{card_holder_name}\n\n"
-        "پس از واریز، تصویر رسید پرداخت را ارسال کنید."
+        f"<tg-emoji emoji-id='5445353829304387411'>💳</tg-emoji> • برای شارژ حساب، مبلغ {amount} تومان را به شماره کارت زیر واریز کنید:\n\n"
+        f"<code>{html.escape(card_number)}</code>\n\n"
+        "<tg-emoji emoji-id='5431515281467917094'>🎥</tg-emoji> • سپس عکس فیش واریزی را همین‌جا ارسال کنید.",
+        parse_mode="HTML",
     )
 
 
@@ -747,6 +785,89 @@ async def receipt_photo_handler(
     await message.answer("✅ فیش شما دریافت شد و برای بررسی به ادمین ارسال شد.")
 
 
+@router.message(RechargeStates.waiting_for_crypto_proof, F.photo)
+async def crypto_proof_photo_handler(
+    message: Message,
+    state: FSMContext,
+    bot: Bot,
+    db: DatabaseHandler,
+) -> None:
+    if message.from_user is None:
+        return
+    user = message.from_user
+    try:
+        await db.add_user_if_not_exists(user.id)
+        request_id = await db.create_recharge_request(
+            user_id=user.id,
+            username=user.username,
+            amount=0,
+            receipt_file_id=message.photo[-1].file_id,
+        )
+        username_text = f"@{user.username}" if user.username else "ندارد"
+        await bot.send_photo(
+            chat_id=settings.ADMIN_ID,
+            photo=message.photo[-1].file_id,
+            caption=(
+                "💱 درخواست شارژ ارزی جدید\n\n"
+                f"👤 کاربر: {username_text}\n"
+                f"🆔 ID: {user.id}\n\n"
+                "🧾 مدرک: اسکرین‌شات تراکنش\n"
+                f"🆔 شماره درخواست: {request_id}"
+            ),
+            reply_markup=build_receipt_review_keyboard(request_id).as_markup(),
+        )
+    except Exception:
+        logger.exception("Forwarding crypto proof photo failed for user_id=%s", user.id)
+        await message.answer("❌ ارسال مدرک با خطا مواجه شد. دوباره تلاش کنید.")
+        return
+    await state.clear()
+    await message.answer("✅ ارسال شد و در انتظار بررسی ادمین است.")
+
+
+@router.message(RechargeStates.waiting_for_crypto_proof, F.text)
+async def crypto_proof_text_handler(
+    message: Message,
+    state: FSMContext,
+    bot: Bot,
+    db: DatabaseHandler,
+) -> None:
+    if message.from_user is None:
+        return
+    proof_hash = _sanitize_crypto_proof_text(message.text)
+    if len(proof_hash) < 8:
+        await message.answer("⚠️ هش تراکنش معتبر نیست. لطفاً متن کامل‌تری ارسال کنید.")
+        return
+    user = message.from_user
+    try:
+        await db.add_user_if_not_exists(user.id)
+        request_id = await db.create_recharge_request(
+            user_id=user.id,
+            username=user.username,
+            amount=0,
+            receipt_file_id=f"crypto_hash:{proof_hash}",
+        )
+        username_text = f"@{user.username}" if user.username else "ندارد"
+        await bot.send_message(
+            chat_id=settings.ADMIN_ID,
+            text=(
+                "💱 درخواست شارژ ارزی جدید\n\n"
+                f"👤 کاربر: {username_text}\n"
+                f"🆔 ID: {user.id}\n\n"
+                "🧾 مدرک: هش تراکنش\n"
+                f"<code>{html.escape(proof_hash)}</code>\n\n"
+                f"🆔 شماره درخواست: {request_id}"
+            ),
+            parse_mode="HTML",
+            reply_markup=build_receipt_review_keyboard(request_id).as_markup(),
+        )
+    except Exception:
+        logger.exception("Forwarding crypto hash proof failed for user_id=%s", user.id)
+        await message.answer("❌ ارسال هش با خطا مواجه شد. دوباره تلاش کنید.")
+        return
+    await state.clear()
+    await message.answer("✅ ارسال شد و در انتظار بررسی ادمین است.")
+
+
 @router.message(RechargeStates.waiting_amount)
 async def invalid_recharge_amount_handler(message: Message) -> None:
     await message.answer("⚠️ لطفاً مبلغ شارژ را فقط به‌صورت متنی و عددی ارسال کنید.")
@@ -755,6 +876,11 @@ async def invalid_recharge_amount_handler(message: Message) -> None:
 @router.message(RechargeStates.waiting_for_receipt)
 async def invalid_receipt_handler(message: Message) -> None:
     await message.answer("⚠️ لطفاً فقط عکس فیش واریزی را ارسال کنید.")
+
+
+@router.message(RechargeStates.waiting_for_crypto_proof)
+async def invalid_crypto_proof_handler(message: Message) -> None:
+    await message.answer("⚠️ لطفاً هش تراکنش یا عکس اسکرین‌شات را ارسال کنید.")
 
 
 @router.callback_query(F.data == "support")

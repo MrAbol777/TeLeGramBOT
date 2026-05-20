@@ -42,8 +42,9 @@ def build_recharge_prompt_menu() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.row(
         InlineKeyboardButton(
-            text="شارژ حساب 💳",
+            text="شارژ حساب",
             callback_data="recharge_wallet",
+            icon_custom_emoji_id="5868268899480375540",
         ),
         InlineKeyboardButton(
             text="انصراف ❌",
