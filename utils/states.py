@@ -22,6 +22,7 @@ class AdminStates(StatesGroup):
     waiting_for_config_list = State()
     waiting_for_crypto_wallet_value = State()
     waiting_for_crypto_approve_amount = State()
+    waiting_for_referral_reward_amount = State()
 
 
 class AdminServiceStates(StatesGroup):

@@ -52,7 +52,7 @@ def build_start_menu() -> InlineKeyboardMarkup:
         ),
         InlineKeyboardButton(
             text="سرویس‌های من",
-            callback_data="my_services",
+            callback_data="my_services_menu",
             icon_custom_emoji_id="5443127283898405358",
         ),
     )

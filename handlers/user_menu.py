@@ -11,6 +11,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from config import settings
 from database.db_handler import DatabaseHandler
+from keyboards.user_menu import build_main_menu
 from keyboards.user_menu import build_recharge_method_menu
 from keyboards.shop_menu import (
     build_model_configs_menu,
@@ -27,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 router = Router(name="user_menu")
 MIN_RECHARGE_AMOUNT = 10_000
+TELEGRAM_MAX_MESSAGE_LENGTH = 4096
 
 PROFILE_MESSAGE = """
 <tg-emoji emoji-id='5190458330719461749'>🧑‍💻</tg-emoji>
@@ -42,6 +44,30 @@ PROFILE_MESSAGE = """
 
 def format_toman(amount: int) -> str:
     return f"{amount:,}".replace(",", "٬")
+
+
+def _normalize_service_text(value: object) -> str:
+    text = str(value or "")
+    text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\x00", "")
+    return html.escape(text)
+
+
+def _chunk_message(text: str, limit: int = TELEGRAM_MAX_MESSAGE_LENGTH) -> list[str]:
+    if len(text) <= limit:
+        return [text]
+
+    chunks: list[str] = []
+    remaining = text
+    while len(remaining) > limit:
+        split_at = remaining.rfind("\n", 0, limit + 1)
+        if split_at <= 0:
+            split_at = limit
+        chunks.append(remaining[:split_at].strip())
+        remaining = remaining[split_at:].lstrip("\n")
+
+    if remaining:
+        chunks.append(remaining.strip())
+    return chunks
 
 
 def build_my_services_actions_keyboard() -> InlineKeyboardMarkup:
@@ -93,24 +119,50 @@ def build_receipt_review_keyboard(request_id: int) -> InlineKeyboardBuilder:
 @router.callback_query(F.data == "connection_guide")
 async def connection_guide_handler(callback: CallbackQuery) -> None:
     await callback.answer()
-    await callback.message.answer(
-        "<blockquote>"
-        "<b>📚 راهنمای اتصال به سرویس‌ها</b>\n\n"
+    guide_text = (
+        "📚• <b>راهنمای اتصال به سرویس‌ها</b>\n\n"
         "برای استفاده از سرویس‌های خریداری شده، ابتدا نرم‌افزار متناسب با دستگاه خود را نصب کنید:\n\n"
-        "<b>📱 اندروید:</b>\n"
-        "<a href=\"https://play.google.com/store/apps/details?id=com.v2ray.ang\">V2rayNG</a> (پیشنهادی)\n"
-        "<b>🍎 آیفون (iOS):</b>\n"
-        "<a href=\"https://apps.apple.com/us/app/v2box-v2ray-client/id1641830530\">V2Box</a>\n"
-        "<a href=\"https://apps.apple.com/us/app/streisand/id6450534064\">Streisand</a>\n"
-        "<b>💻 ویندوز:</b>\n"
-        "<a href=\"https://github.com/2dust/v2rayN/releases\">V2rayN</a>\n"
-        "<b>📖 آموزش کوتاه:</b>\n\n"
+        "<tg-emoji emoji-id='5440910041391573452'>💚</tg-emoji> • <b>اندروید:</b>\n"
+        "<tg-emoji emoji-id='6050646916109179497'>🔐</tg-emoji>• V2rayNG\n"
+        "<tg-emoji emoji-id='6023639019290630537'>📱</tg-emoji>• Hiddify (پیشنهادی)\n"
+        "<tg-emoji emoji-id='6050626661043411760'>🔐</tg-emoji>• Npv\n\n"
+        "<tg-emoji emoji-id='5935790552787193983'>🍏</tg-emoji> <b>آیفون (iOS):</b>\n"
+        "<tg-emoji emoji-id='5866266486942733691'>🔐</tg-emoji>• V2Box\n"
+        "<tg-emoji emoji-id='5933950773481181919'>🔐</tg-emoji>• Streisand (پیشنهادی)\n\n"
+        "<tg-emoji emoji-id='5933550168996581523'>💻</tg-emoji> <b>ویندوز:</b>\n"
+        "<tg-emoji emoji-id='5866022060353918430'>📱</tg-emoji>• V2rayN\n\n"
+        "<tg-emoji emoji-id='5874978802332865390'>😀</tg-emoji> <b>آموزش کوتاه:</b>\n\n"
         "۱. لینک کانفیگ را از بخش «سرویس‌های من» کپی کنید.\n\n"
         "۲. وارد برنامه شده و علامت + یا Import را بزنید.\n\n"
         "۳. گزینه Import from Clipboard را انتخاب کرده و متصل شوید."
-        "</blockquote>",
+    )
+
+    keyboard = InlineKeyboardBuilder()
+    keyboard.button(text="🔙 بازگشت", callback_data="main_menu")
+
+    await callback.message.edit_text(
+        text=guide_text,
+        reply_markup=keyboard.as_markup(),
         parse_mode="HTML",
-        disable_web_page_preview=True,
+    )
+
+
+@router.callback_query(F.data == "main_menu")
+async def main_menu_handler(callback: CallbackQuery) -> None:
+    await callback.answer()
+    await callback.message.edit_text(
+        text=(
+            "<b><tg-emoji emoji-id='5462910521739063094'>😀</tg-emoji> سلام ، به مجموعه Nox خوش اومدی .</b>\n\n"
+            "<tg-emoji emoji-id='5210956306952758910'>👀</tg-emoji> • قابلیت های ربات مجموعه :\n"
+            "<tg-emoji emoji-id='5956109811136335664'>🛜</tg-emoji>• خرید سرویس\n"
+            "<tg-emoji emoji-id='5809695698865623554'>🖥</tg-emoji>• مشاهده اطلاعات سرویس\n"
+            "<tg-emoji emoji-id='5868268899480375540'>💎</tg-emoji>• شارژ موجودی\n"
+            "<tg-emoji emoji-id='5839449299557028781'>🎁</tg-emoji>• زیرمجموعه گیری\n"
+            "<tg-emoji emoji-id='5875008300168254524'>📫</tg-emoji>• ثبت درخواست نمایندگی\n\n"
+            "<tg-emoji emoji-id='5803322139197051431'>❤️</tg-emoji> یکی از دکمه های زیر رو انتخاب کن تا شروع کنیم"
+        ),
+        parse_mode="HTML",
+        reply_markup=build_main_menu(),
     )
 
 
@@ -152,8 +204,8 @@ async def user_profile_handler(
     )
 
 
-@router.callback_query(F.data == "referral_info")
-async def referral_info_handler(callback: CallbackQuery, db: DatabaseHandler, bot: Bot) -> None:
+@router.callback_query(F.data == "referral_menu")
+async def referral_menu_handler(callback: CallbackQuery, db: DatabaseHandler, bot: Bot) -> None:
     await callback.answer()
     if callback.from_user is None:
         return
@@ -161,19 +213,23 @@ async def referral_info_handler(callback: CallbackQuery, db: DatabaseHandler, bo
     user_id = callback.from_user.id
     try:
         referral_count = await db.get_referral_count(user_id)
+        reward_raw = await db.get_setting("referral_reward_amount", "2000")
+        reward_amount = int(str(reward_raw or "2000"))
         bot_info = await bot.get_me()
     except Exception:
         logger.exception("Loading referral info failed for user_id=%s", user_id)
         await callback.message.answer("❌ دریافت اطلاعات زیرمجموعه‌گیری با خطا مواجه شد.")
         return
 
-    bot_username = bot_info.username or ""
+    bot_username = (bot_info.username or "").strip()
     referral_link = f"https://t.me/{bot_username}?start={user_id}" if bot_username else f"/start {user_id}"
     await callback.message.answer(
-        "👥 سیستم زیرمجموعه‌گیری\n\n"
-        f"🔗 لینک اختصاصی شما:\n<code>{html.escape(referral_link)}</code>\n\n"
-        f"📊 تعداد کل افراد دعوت‌شده: <b>{referral_count}</b>\n\n"
-        "🎁 با دعوت هر نفر از دوستانتان، مبلغ ۲,۰۰۰ تومان اعتبار هدیه دریافت کنید!",
+        "<tg-emoji emoji-id='5372926953978341366'>👥</tg-emoji> • سیستم زیرمجموعه‌گیری\n\n"
+        "<tg-emoji emoji-id='6221940219147459142'>🔗</tg-emoji> • لینک اختصاصی شما:\n"
+        f"<code>{html.escape(referral_link)}</code>\n\n"
+        f"<tg-emoji emoji-id='5231200819986047254'>📊</tg-emoji> • تعداد کل افراد دعوت‌شده: {referral_count}\n\n"
+        "<tg-emoji emoji-id='6224341518182784992'>🎁</tg-emoji> • "
+        f"با دعوت هر نفر از دوستانتان، مبلغ {format_toman(reward_amount)} تومان اعتبار هدیه دریافت کنید!",
         parse_mode="HTML",
     )
 
@@ -384,10 +440,20 @@ async def send_model_configs_page(message: Message, db: DatabaseHandler, model: 
         await message.answer("❌ دریافت لیست کانفیگ‌ها با خطا مواجه شد.")
         return
 
-    model_title = "Nox Plus" if model == "nox_plus" else "Nox Multi"
+    if model == "nox_plus":
+        text = (
+            '<tg-emoji emoji-id="5875306327948923856">💎</tg-emoji> • <b>سرویس : Nox Plus</b>\n\n'
+            '<tg-emoji emoji-id="5802888128456823766">✅</tg-emoji> • حجم دلخواه خود را انتخاب کنید.'
+        )
+    else:
+        text = (
+            '<tg-emoji emoji-id="5920303364574285697">🍽</tg-emoji> • <b>سرویس : Nox Multi</b>\n\n'
+            '<tg-emoji emoji-id="5802888128456823766">✅</tg-emoji> • حجم دلخواه خود را انتخاب کنید.'
+        )
+
     await message.answer(
-        f"مدل انتخابی: {model_title}\n"
-        "یکی از کانفیگ‌ها را انتخاب کنید:",
+        text,
+        parse_mode="HTML",
         reply_markup=build_model_configs_menu(
             model=model,
             configs=configs,
@@ -671,15 +737,15 @@ async def cancel_buy_handler(callback: CallbackQuery) -> None:
     await callback.message.answer("❌ فرآیند خرید لغو شد.")
 
 
-@router.callback_query(F.data == "my_services")
-async def my_services_handler(callback: CallbackQuery, db: DatabaseHandler) -> None:
+@router.callback_query(F.data == "my_services_menu")
+async def my_services_menu_handler(callback: CallbackQuery, db: DatabaseHandler) -> None:
     await callback.answer()
     if callback.from_user is None:
         return
 
     user_id = callback.from_user.id
     try:
-        services = await db.get_user_active_services(user_id)
+        services = await db.get_user_services(user_id)
     except Exception:
         logger.exception("Fetching active services failed for user_id=%s", user_id)
         await callback.message.answer("❌ دریافت سرویس‌های شما با خطا مواجه شد.")
@@ -687,23 +753,33 @@ async def my_services_handler(callback: CallbackQuery, db: DatabaseHandler) -> N
 
     if not services:
         await callback.message.answer(
-            "<tg-emoji emoji-id='5411438796651262830'>📭</tg-emoji> سرویسی موجود نیست",
+            "📭 در حال حاضر هیچ سرویسی موجود نیست.",
             reply_markup=build_my_services_actions_keyboard(),
         )
         return
 
-    lines = [f"<tg-emoji emoji-id='5334882760735598374'>📝</tg-emoji> تعداد کل سرویس‌ها: {len(services)}", ""]
-    for index, (_config_id, service_name, config_link, expires_at) in enumerate(services[:15], start=1):
-        lines.append(f"{index}) {html.escape(service_name)}")
-        lines.append(f"⏳ انقضا: {html.escape(expires_at)}")
-        lines.append(f"<code>{html.escape(config_link)}</code>")
+    lines = [f"📝 تعداد کل سرویس‌ها: {len(services)}", ""]
+    for index, service in enumerate(services[:15], start=1):
+        service_name = _normalize_service_text(service.get("name", "سرویس"))
+        expires_at = _normalize_service_text(service.get("expires_at", "نامشخص"))
+        config_link = _normalize_service_text(service.get("config_link", ""))
+        lines.append(f"{index}) {service_name}")
+        lines.append(f"⏳ انقضا: {expires_at}")
+        lines.append(f"<code>{config_link or '—'}</code>")
         lines.append("")
 
-    await callback.message.answer(
-        "\n".join(lines).strip(),
-        parse_mode="HTML",
-        reply_markup=build_my_services_actions_keyboard(),
-    )
+    text = "\n".join(lines).strip()
+    print("DEBUG MESSAGE:")
+    print(text)
+    print("LENGTH:", len(text))
+
+    chunks = _chunk_message(text)
+    for index, chunk in enumerate(chunks):
+        await callback.message.answer(
+            chunk,
+            parse_mode="HTML",
+            reply_markup=build_my_services_actions_keyboard() if index == len(chunks) - 1 else None,
+        )
 
 
 @router.callback_query(F.data.startswith("purchase_info:"))
@@ -899,8 +975,9 @@ async def support_handler(callback: CallbackQuery) -> None:
         has_url_button = True
 
     text = (
-        "👨‍💻 پشتیبانی\n"
-        f"برای ارتباط با پشتیبانی به این شناسه پیام دهید:\n<code>{support_id}</code>"
+        '<tg-emoji emoji-id="5444965061749644170">👨‍💻</tg-emoji> <b>• پشتیبانی</b>\n\n'
+        '<tg-emoji emoji-id="6030646911269081346">📣</tg-emoji> • برای ارتباط با پشتیبانی به این شناسه پیام دهید:\n\n'
+        '<tg-emoji emoji-id="5956392076387034439">💫</tg-emoji> • @NoxSupport1'
     )
     await callback.message.answer(
         text,

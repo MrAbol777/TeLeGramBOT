@@ -40,12 +40,24 @@ def build_main_menu() -> InlineKeyboardMarkup:
         ),
         InlineKeyboardButton(
             text="سرویس‌های من",
-            callback_data="my_services",
+            callback_data="my_services_menu",
             icon_custom_emoji_id="5443127283898405358",
         ),
-        InlineKeyboardButton(text="👥 زیرمجموعه‌گیری", callback_data="referral_info"),
-        InlineKeyboardButton(text="📚 راهنمای اتصال", callback_data="connection_guide"),
-        InlineKeyboardButton(text="👨‍💻 پشتیبانی", callback_data="support"),
+        InlineKeyboardButton(
+            text="زیرمجموعه‌گیری",
+            callback_data="referral_menu",
+            icon_custom_emoji_id="5839449299557028781",
+        ),
+        InlineKeyboardButton(
+            text="راهنمای اتصال",
+            callback_data="connection_guide",
+            icon_custom_emoji_id="5222444124698853913",
+        ),
+        InlineKeyboardButton(
+            text="ارتباط با پشتیبانی",
+            callback_data="support",
+            icon_custom_emoji_id="5810032437186531403",
+        ),
     )
     builder.adjust(2)
     return builder.as_markup()

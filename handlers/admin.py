@@ -1137,6 +1137,102 @@ async def payment_management_handler(message: Message, db: DatabaseHandler) -> N
     )
 
 
+@router.message(F.text == "<emoji id=6224341518182784992>🎁</emoji> مدیریت پاداش دعوت")
+async def referral_reward_management_handler(message: Message, state: FSMContext, db: DatabaseHandler) -> None:
+    await state.clear()
+    reward_raw = await db.get_setting("referral_reward_amount", "2000")
+    try:
+        reward_amount = max(0, int(str(reward_raw or "0")))
+    except ValueError:
+        reward_amount = 0
+
+    inline_builder = InlineKeyboardBuilder()
+    inline_builder.row(
+        InlineKeyboardButton(
+            text="✏️ ویرایش مبلغ پاداش دعوت",
+            callback_data="admin_edit_referral_reward",
+        )
+    )
+    inline_builder.row(
+        InlineKeyboardButton(
+            text="🔙 منوی ادمین",
+            callback_data="admin_back:main_admin_menu",
+        )
+    )
+    await message.answer(
+        "🎁 مدیریت پاداش دعوت\n\n"
+        f"مبلغ فعلی پاداش: `{format_toman(reward_amount)}` تومان\n\n"
+        "برای تغییر، گزینه ویرایش را انتخاب کنید.",
+        parse_mode="Markdown",
+        reply_markup=inline_builder.as_markup(),
+    )
+
+
+@router.callback_query(F.data == "admin_edit_referral_reward")
+async def referral_reward_edit_start_callback_handler(
+    callback: CallbackQuery,
+    state: FSMContext,
+    db: DatabaseHandler,
+) -> None:
+    await callback.answer()
+    reward_raw = await db.get_setting("referral_reward_amount", "2000")
+    try:
+        reward_amount = max(0, int(str(reward_raw or "0")))
+    except ValueError:
+        reward_amount = 0
+
+    await state.set_state(AdminStates.waiting_for_referral_reward_amount)
+    await callback.message.answer(
+        "🎁 مدیریت پاداش دعوت\n\n"
+        f"مبلغ فعلی پاداش:\n{format_toman(reward_amount)} تومان\n\n"
+        "مبلغ جدید را ارسال کنید.",
+    )
+
+
+@router.message(F.text == "✏️ ویرایش مبلغ پاداش دعوت")
+async def referral_reward_edit_start_handler(message: Message, state: FSMContext, db: DatabaseHandler) -> None:
+    reward_raw = await db.get_setting("referral_reward_amount", "2000")
+    try:
+        reward_amount = max(0, int(str(reward_raw or "0")))
+    except ValueError:
+        reward_amount = 0
+
+    await state.set_state(AdminStates.waiting_for_referral_reward_amount)
+    await message.answer(
+        "🎁 ویرایش پاداش دعوت\n"
+        f"مبلغ فعلی: `{format_toman(reward_amount)}` تومان\n\n"
+        "مبلغ جدید را به تومان و فقط به‌صورت عددی ارسال کنید.",
+        parse_mode="Markdown",
+    )
+
+
+@router.message(AdminStates.waiting_for_referral_reward_amount, F.text)
+async def referral_reward_set_amount_handler(message: Message, state: FSMContext, db: DatabaseHandler) -> None:
+    amount_text = message.text.strip().replace("٬", "").replace(",", "")
+    if not amount_text.isdigit():
+        await message.answer("⚠️ مبلغ نامعتبر است. لطفاً فقط عدد ارسال کنید.")
+        return
+
+    amount = int(amount_text)
+    if amount < 0:
+        await message.answer("⚠️ مبلغ نمی‌تواند منفی باشد.")
+        return
+
+    try:
+        await db.update_setting("referral_reward_amount", str(amount))
+    except Exception:
+        logger.exception("Updating referral reward amount failed")
+        await message.answer("❌ ذخیره مبلغ پاداش دعوت با خطا مواجه شد.")
+        return
+
+    await state.clear()
+    await message.answer(
+        f"✅ مبلغ پاداش دعوت با موفقیت به `{format_toman(amount)}` تومان تغییر کرد.",
+        parse_mode="Markdown",
+        reply_markup=build_admin_menu(),
+    )
+
+
 @router.message(F.text == "💱 مدیریت ولت‌های ارزی")
 async def crypto_wallets_management_handler(message: Message, state: FSMContext, db: DatabaseHandler) -> None:
     await state.clear()

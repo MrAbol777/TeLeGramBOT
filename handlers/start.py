@@ -11,7 +11,6 @@ from keyboards.user_menu import build_main_menu
 
 logger = logging.getLogger(__name__)
 router = Router(name="start")
-REFERRAL_REWARD_AMOUNT = 2000
 
 WELCOME_MESSAGE = """
 <b><tg-emoji emoji-id='5462910521739063094'>😀</tg-emoji> سلام ، به مجموعه Nox خوش اومدی .</b>
@@ -41,14 +40,23 @@ async def start_handler(message: Message, db: DatabaseHandler, bot: Bot) -> None
             referral_id = parsed_ref_id
 
     try:
+        reward_raw = await db.get_setting("referral_reward_amount", "2000")
+        try:
+            referral_reward_amount = max(0, int(str(reward_raw or "2000")))
+        except ValueError:
+            referral_reward_amount = 2000
+
         user_exists = await db.user_exists(user_id)
         if not user_exists:
             await db.add_user_with_referrer(user_id, referral_id)
             if referral_id is not None:
-                await db.add_balance(referral_id, REFERRAL_REWARD_AMOUNT)
+                await db.add_balance(referral_id, referral_reward_amount)
                 await bot.send_message(
                     referral_id,
-                    "تبریک! یک کاربر جدید با لینک شما عضو شد و ۲۰۰۰ تومان هدیه گرفتید.",
+                    (
+                        "تبریک! یک کاربر جدید با لینک شما عضو شد و "
+                        f"{referral_reward_amount:,} تومان هدیه گرفتید."
+                    ).replace(",", "٬"),
                 )
         else:
             await db.add_user_if_not_exists(user_id)

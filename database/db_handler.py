@@ -233,6 +233,12 @@ class DatabaseHandler:
                 VALUES (1, '', '')
                 """
             )
+            await db.execute(
+                """
+                INSERT OR IGNORE INTO settings (key, value)
+                VALUES ('referral_reward_amount', '2000')
+                """
+            )
             await db.commit()
 
     async def get_setting(self, key: str, default: str | None = None) -> str | None:
@@ -758,25 +764,7 @@ class DatabaseHandler:
             ) as cursor:
                 return await cursor.fetchall()
 
-    @staticmethod
-    def _extract_duration_days(duration: str) -> int | None:
-        normalized = (duration or "").strip().lower()
-        if not normalized:
-            return None
-        match = re.search(r"(\d+)", normalized)
-        if not match:
-            return None
-        value = int(match.group(1))
-        if "ماه" in normalized:
-            return value * 30
-        if "سال" in normalized:
-            return value * 365
-        return value
-
-    async def get_user_active_services(
-        self,
-        user_id: int,
-    ) -> list[tuple[int, str, str, str]]:
+    async def get_user_services(self, user_id: int) -> list[dict[str, object]]:
         async with aiosqlite.connect(self.db_path) as db:
             async with db.execute(
                 """
@@ -790,7 +778,7 @@ class DatabaseHandler:
                 rows = await cursor.fetchall()
 
         now = datetime.now(timezone.utc)
-        services: list[tuple[int, str, str, str]] = []
+        services: list[dict[str, object]] = []
         for row in rows:
             config_id = int(row[0])
             title = str(row[1] or row[2] or "سرویس")
@@ -814,8 +802,45 @@ class DatabaseHandler:
                     continue
                 expires_at = expiry_dt.strftime("%Y-%m-%d %H:%M:%S UTC")
 
-            services.append((config_id, title, config_content, expires_at))
+            services.append(
+                {
+                    "id": config_id,
+                    "name": title,
+                    "config_link": config_content,
+                    "expires_at": expires_at,
+                }
+            )
         return services
+
+    @staticmethod
+    def _extract_duration_days(duration: str) -> int | None:
+        normalized = (duration or "").strip().lower()
+        if not normalized:
+            return None
+        match = re.search(r"(\d+)", normalized)
+        if not match:
+            return None
+        value = int(match.group(1))
+        if "ماه" in normalized:
+            return value * 30
+        if "سال" in normalized:
+            return value * 365
+        return value
+
+    async def get_user_active_services(
+        self,
+        user_id: int,
+    ) -> list[tuple[int, str, str, str]]:
+        services = await self.get_user_services(user_id)
+        return [
+            (
+                int(service["id"]),
+                str(service["name"]),
+                str(service["config_link"]),
+                str(service["expires_at"]),
+            )
+            for service in services
+        ]
 
     async def get_admin_stats(self) -> dict[str, int]:
         async with aiosqlite.connect(self.db_path) as db:

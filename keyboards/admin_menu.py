@@ -8,6 +8,7 @@ def build_admin_menu() -> ReplyKeyboardMarkup:
             [KeyboardButton(text="📊 آمار موجودی")],
             [KeyboardButton(text="📊 آمار کلی")],
             [KeyboardButton(text="📊 گزارش فروش")],
+            [KeyboardButton(text="<emoji id=6224341518182784992>🎁</emoji> مدیریت پاداش دعوت")],
             [KeyboardButton(text="💳 مدیریت پرداخت")],
             [KeyboardButton(text="💱 مدیریت ولت‌های ارزی")],
             [KeyboardButton(text="📢 ارسال همگانی")],
