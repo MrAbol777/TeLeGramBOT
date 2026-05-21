@@ -13,6 +13,7 @@ from config import settings
 from database.db_handler import DatabaseHandler
 from keyboards.user_menu import build_main_menu
 from keyboards.user_menu import build_recharge_method_menu
+from handlers.start import send_main_menu
 from keyboards.shop_menu import (
     build_model_configs_menu,
     build_insufficient_balance_menu,
@@ -79,7 +80,7 @@ def build_my_services_actions_keyboard() -> InlineKeyboardMarkup:
     }
     back_payload = {
         "text": "بازگشت",
-        "callback_data": "noop",
+        "callback_data": "main_menu",
         "icon_custom_emoji_id": "5372926953978341366",
     }
     try:
@@ -148,22 +149,10 @@ async def connection_guide_handler(callback: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data == "main_menu")
-async def main_menu_handler(callback: CallbackQuery) -> None:
+async def main_menu_handler(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
     await callback.answer()
-    await callback.message.edit_text(
-        text=(
-            "<b><tg-emoji emoji-id='5462910521739063094'>😀</tg-emoji> سلام ، به مجموعه Nox خوش اومدی .</b>\n\n"
-            "<tg-emoji emoji-id='5210956306952758910'>👀</tg-emoji> • قابلیت های ربات مجموعه :\n"
-            "<tg-emoji emoji-id='5956109811136335664'>🛜</tg-emoji>• خرید سرویس\n"
-            "<tg-emoji emoji-id='5809695698865623554'>🖥</tg-emoji>• مشاهده اطلاعات سرویس\n"
-            "<tg-emoji emoji-id='5868268899480375540'>💎</tg-emoji>• شارژ موجودی\n"
-            "<tg-emoji emoji-id='5839449299557028781'>🎁</tg-emoji>• زیرمجموعه گیری\n"
-            "<tg-emoji emoji-id='5875008300168254524'>📫</tg-emoji>• ثبت درخواست نمایندگی\n\n"
-            "<tg-emoji emoji-id='5803322139197051431'>❤️</tg-emoji> یکی از دکمه های زیر رو انتخاب کن تا شروع کنیم"
-        ),
-        parse_mode="HTML",
-        reply_markup=build_main_menu(),
-    )
+    await send_main_menu(callback.message)
 
 
 @router.callback_query(F.data == "user_profile")

@@ -26,6 +26,14 @@ WELCOME_MESSAGE = """
 """.strip()
 
 
+async def send_main_menu(message: Message) -> None:
+    await message.answer(
+        text=WELCOME_MESSAGE,
+        parse_mode="HTML",
+        reply_markup=build_main_menu(),
+    )
+
+
 @router.message(CommandStart())
 async def start_handler(message: Message, db: DatabaseHandler, bot: Bot) -> None:
     if message.from_user is None:
@@ -65,8 +73,4 @@ async def start_handler(message: Message, db: DatabaseHandler, bot: Bot) -> None
         await message.answer("خطایی در ثبت اطلاعات رخ داد. لطفاً دوباره تلاش کنید.")
         return
 
-    await message.answer(
-        text=WELCOME_MESSAGE,
-        parse_mode="HTML",
-        reply_markup=build_main_menu(),
-    )
+    await send_main_menu(message)
