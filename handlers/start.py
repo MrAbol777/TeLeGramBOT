@@ -20,7 +20,6 @@ WELCOME_MESSAGE = """
 <tg-emoji emoji-id='5809695698865623554'>🖥</tg-emoji>• مشاهده اطلاعات سرویس
 <tg-emoji emoji-id='5868268899480375540'>💎</tg-emoji>• شارژ موجودی
 <tg-emoji emoji-id='5839449299557028781'>🎁</tg-emoji>• زیرمجموعه گیری
-<tg-emoji emoji-id='5875008300168254524'>📫</tg-emoji>• ثبت درخواست نمایندگی
 
 <tg-emoji emoji-id='5803322139197051431'>❤️</tg-emoji> یکی از دکمه های زیر رو انتخاب کن تا شروع کنیم
 """.strip()

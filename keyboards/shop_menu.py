@@ -73,12 +73,12 @@ def build_model_selection_menu() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
 
     plus_payload = {
-        "text": "💎• Nox Plus",
+        "text": "• Nox Plus",
         "callback_data": "buy_model:nox_plus",
         "icon_custom_emoji_id": "5875306327948923856",
     }
     multi_payload = {
-        "text": "🍽• Nox Multi",
+        "text": "• Nox Multi",
         "callback_data": "buy_model:nox_multi",
         "icon_custom_emoji_id": "5920303364574285697",
     }
