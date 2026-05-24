@@ -476,11 +476,11 @@ async def buy_config_handler(callback: CallbackQuery, db: DatabaseHandler) -> No
 
     _, title, price, duration, description, _config_content = config
     await callback.message.answer(
-        "📦 Service Details\n\n"
-        f"Title: {title}\n\n"
-        f"Price: {price:,} تومان\n\n"
-        f"Duration: {duration}\n\n"
-        "Description:\n"
+        "📦 مشخصات سرویس\n\n"
+        f"عنوان: {title}\n\n"
+        f"قیمت: {price:,} تومان\n\n"
+        f"موجودی: {duration}\n\n"
+        "توضیحات:\n"
         f"{description}\n\n"
         "آیا مایل به خرید این سرویس هستید؟".replace(",", "٬"),
         reply_markup=build_model_purchase_confirmation_menu(config_id),

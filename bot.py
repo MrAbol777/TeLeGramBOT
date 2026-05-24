@@ -6,8 +6,15 @@ from database.db_handler import DatabaseHandler
 from handlers import admin, start, user_menu
 
 async def main():
-    # تنظیمات لاگ (برای دیدن اتفاقات در کنسول)
-    logging.basicConfig(level=logging.INFO)
+    # تنظیمات لاگ (ذخیره در فایل + نمایش در کنسول)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        handlers=[
+            logging.FileHandler("logs.txt", encoding="utf-8"),
+            logging.StreamHandler(),
+        ],
+    )
 
     # راه اندازی دیتابیس
     db = DatabaseHandler("database.db")
@@ -29,7 +36,7 @@ async def main():
     # وصل کردن دیتابیس به تمام هندلرها
     dp["db"] = db
 
-    print("--- Bot is Running ---")
+    logging.getLogger(__name__).info("--- Bot is Running ---")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":

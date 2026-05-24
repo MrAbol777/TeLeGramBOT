@@ -156,8 +156,8 @@ def build_model_configs_menu(
 def build_model_purchase_confirmation_menu(config_id: int) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.row(
-        InlineKeyboardButton(text="✅ Confirm Purchase", callback_data=f"confirm_buy:{config_id}"),
-        InlineKeyboardButton(text="❌ Cancel", callback_data="cancel_buy"),
+        InlineKeyboardButton(text="✅  خرید", callback_data=f"confirm_buy:{config_id}"),
+        InlineKeyboardButton(text="❌ انصراف", callback_data="cancel_buy"),
     )
     return builder.as_markup()
 
