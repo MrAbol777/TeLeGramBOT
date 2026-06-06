@@ -71,9 +71,14 @@ BOT_TOKEN=PASTE_YOUR_BOT_TOKEN_HERE
 ADMIN_ID=123456789
 SUPPORT_ID=@support
 ADMIN_CARD_NUMBER=6037-xxxx-xxxx-xxxx
+UPTIME_BOT_TOKEN=PASTE_UPTIME_BOT_TOKEN
+UPTIME_ADMIN_ID=123456789
+UPTIME_MAIN_BOT_USERNAME=@MainBotUsername
+UPTIME_LOG_FILE_PATH=/absolute/path/to/logs.txt
 ```
 
 > `ADMIN_ID` باید آیدی عددی تلگرام ادمین اصلی باشد.
+> تنظیمات `UPTIME_*` برای بات مانیتورینگ داخل `TiMeUp` استفاده می‌شوند.
 
 ### 3) اجرای ربات
 

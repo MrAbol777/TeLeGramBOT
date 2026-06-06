@@ -1,4 +1,5 @@
 import re
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
 import aiosqlite
@@ -8,8 +9,335 @@ class DatabaseHandler:
     def __init__(self, db_path: str):
         self.db_path = db_path
 
-    async def initialize(self):
-        async with aiosqlite.connect(self.db_path) as db:
+    @asynccontextmanager
+    async def _connect(self):
+        async with aiosqlite.connect(self.db_path, timeout=30) as db:
+            await db.execute("PRAGMA foreign_keys = ON")
+            await db.execute("PRAGMA journal_mode = WAL")
+            await db.execute("PRAGMA synchronous = NORMAL")
+            await db.execute("PRAGMA busy_timeout = 5000")
+            await db.execute("PRAGMA temp_store = MEMORY")
+            yield db
+
+    async def _table_exists(self, db, table_name: str) -> bool:
+        async with db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ? LIMIT 1",
+            (table_name,),
+        ) as cursor:
+            return await cursor.fetchone() is not None
+
+    async def _index_exists(self, db, index_name: str) -> bool:
+        async with db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='index' AND name = ? LIMIT 1",
+            (index_name,),
+        ) as cursor:
+            return await cursor.fetchone() is not None
+
+    async def _get_table_columns(self, db, table_name: str) -> set[str]:
+        async with db.execute(f"PRAGMA table_info({table_name})") as cursor:
+            rows = await cursor.fetchall()
+            return {str(row[1]) for row in rows}
+
+    async def _set_migration_meta(self, db, key: str, value: str) -> None:
+        await db.execute(
+            """
+            INSERT INTO __migration_meta (key, value)
+            VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (key, value),
+        )
+
+    async def _get_migration_meta(self, db, key: str) -> str | None:
+        async with db.execute(
+            "SELECT value FROM __migration_meta WHERE key = ? LIMIT 1",
+            (key,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return str(row[0]) if row else None
+
+    async def _insert_migration_audit(
+        self,
+        db,
+        *,
+        table_name: str,
+        record_id: str,
+        action: str,
+        old_value: str,
+        new_value: str,
+    ) -> None:
+        await db.execute(
+            """
+            INSERT INTO migration_audit (table_name, record_id, action, old_value, new_value, migrated_at)
+            VALUES (?, ?, ?, ?, ?, datetime('now'))
+            """,
+            (table_name, record_id, action, old_value, new_value),
+        )
+
+    async def _collect_missing_user_ids(self, db) -> list[int]:
+        missing: set[int] = set()
+        queries = [
+            """
+            SELECT DISTINCT t.user_id
+            FROM transactions t
+            LEFT JOIN users u ON u.user_id = t.user_id
+            WHERE u.user_id IS NULL
+            """,
+            """
+            SELECT DISTINCT rr.user_id
+            FROM recharge_requests rr
+            LEFT JOIN users u ON u.user_id = rr.user_id
+            WHERE u.user_id IS NULL
+            """,
+            """
+            SELECT DISTINCT s.user_id
+            FROM sales s
+            LEFT JOIN users u ON u.user_id = s.user_id
+            WHERE s.user_id IS NOT NULL AND u.user_id IS NULL
+            """,
+        ]
+        for query in queries:
+            async with db.execute(query) as cursor:
+                rows = await cursor.fetchall()
+                for row in rows:
+                    if row and row[0] is not None:
+                        missing.add(int(row[0]))
+        return sorted(missing)
+
+    async def _collect_missing_config_ids(self, db) -> list[int]:
+        missing: set[int] = set()
+        queries = [
+            """
+            SELECT DISTINCT ci.config_id
+            FROM config_items ci
+            LEFT JOIN configs c ON c.id = ci.config_id
+            WHERE c.id IS NULL
+            """,
+            """
+            SELECT DISTINCT s.config_id
+            FROM sales s
+            LEFT JOIN configs c ON c.id = s.config_id
+            WHERE s.config_id IS NOT NULL AND c.id IS NULL
+            """,
+        ]
+        for query in queries:
+            async with db.execute(query) as cursor:
+                rows = await cursor.fetchall()
+                for row in rows:
+                    if row and row[0] is not None:
+                        missing.add(int(row[0]))
+        return sorted(missing)
+
+    async def _dry_run_report(self) -> dict[str, int | str]:
+        async with self._connect() as db:
+            config_items_columns = await self._get_table_columns(db, "config_items")
+            has_fk_v2 = (await self._get_migration_meta(db, "fk_v2_zero_loss_applied")) == "1"
+            backup_table_name = f"config_items_backup_{datetime.now(timezone.utc):%Y%m%d}"
+            backup_exists = await self._table_exists(db, backup_table_name)
+
+            async with db.execute("SELECT COUNT(*) FROM config_items") as cursor:
+                total = int((await cursor.fetchone() or [0])[0])
+            async with db.execute(
+                """
+                SELECT COUNT(*)
+                FROM config_items ci
+                LEFT JOIN configs c ON c.id = ci.config_id
+                WHERE c.id IS NOT NULL
+                """
+            ) as cursor:
+                healthy = int((await cursor.fetchone() or [0])[0])
+            orphan = max(0, total - healthy)
+            missing_config_ids = await self._collect_missing_config_ids(db)
+            return {
+                "config_items_total": total,
+                "config_items_healthy": healthy,
+                "config_items_orphan": orphan,
+                "placeholder_needed": len(missing_config_ids),
+                "quarantine_needed": 0,
+                "backup_needed": 0 if has_fk_v2 else (0 if backup_exists else 1),
+                "backup_table_today_exists": 1 if backup_exists else 0,
+                "fk_v2_already_applied": 1 if has_fk_v2 else 0,
+                "config_items_has_config_id": 1 if "config_id" in config_items_columns else 0,
+            }
+
+    async def _run_fk_v2_zero_loss_migration(self, db) -> None:
+        fk_v2_applied = (await self._get_migration_meta(db, "fk_v2_zero_loss_applied")) == "1"
+        if fk_v2_applied:
+            return
+
+        backup_table_name = f"config_items_backup_{datetime.now(timezone.utc):%Y%m%d}"
+        if await self._table_exists(db, backup_table_name):
+            raise RuntimeError(
+                f"Zero-loss migration stopped: backup table already exists ({backup_table_name})"
+            )
+
+        await db.execute(f"CREATE TABLE {backup_table_name} AS SELECT * FROM config_items")
+        await self._insert_migration_audit(
+            db,
+            table_name="config_items",
+            record_id="*",
+            action="backup_created",
+            old_value="",
+            new_value=backup_table_name,
+        )
+
+        missing_user_ids = await self._collect_missing_user_ids(db)
+        for missing_user_id in missing_user_ids:
+            await db.execute(
+                """
+                INSERT OR IGNORE INTO users (user_id, balance, referred_by)
+                VALUES (?, 0, NULL)
+                """,
+                (missing_user_id,),
+            )
+            await self._insert_migration_audit(
+                db,
+                table_name="users",
+                record_id=str(missing_user_id),
+                action="placeholder_user_created",
+                old_value="missing",
+                new_value="created",
+            )
+
+        missing_config_ids = await self._collect_missing_config_ids(db)
+        for missing_config_id in missing_config_ids:
+            await db.execute(
+                """
+                INSERT OR IGNORE INTO configs (
+                    id, config_content, category, is_sold, sold_to, sold_at,
+                    model, title, price, duration, speed, description, stock, is_active, created_at
+                )
+                VALUES (
+                    ?, '', 'Recovered', 1, NULL, datetime('now'),
+                    'Recovered', '[Recovered]', 0, 'Recovered', 'Recovered',
+                    'Recovered placeholder', 0, 0, datetime('now')
+                )
+                """,
+                (missing_config_id,),
+            )
+            await self._insert_migration_audit(
+                db,
+                table_name="configs",
+                record_id=str(missing_config_id),
+                action="placeholder_config_created",
+                old_value="missing",
+                new_value="created",
+            )
+
+        await db.execute("PRAGMA foreign_keys = OFF")
+
+        await db.execute("ALTER TABLE transactions RENAME TO transactions_old")
+        await db.execute(
+            """
+            CREATE TABLE transactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                amount INTEGER NOT NULL,
+                type TEXT NOT NULL CHECK(type IN ('recharge', 'purchase')),
+                description TEXT,
+                timestamp TEXT NOT NULL DEFAULT (datetime('now')),
+                FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
+            )
+            """
+        )
+        await db.execute(
+            """
+            INSERT INTO transactions (id, user_id, amount, type, description, timestamp)
+            SELECT id, user_id, amount, type, description, timestamp
+            FROM transactions_old
+            """
+        )
+        await db.execute("DROP TABLE transactions_old")
+
+        await db.execute("ALTER TABLE recharge_requests RENAME TO recharge_requests_old")
+        await db.execute(
+            """
+            CREATE TABLE recharge_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                username TEXT,
+                amount INTEGER NOT NULL,
+                receipt_file_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK(status IN ('pending', 'approved', 'rejected')),
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
+            )
+            """
+        )
+        await db.execute(
+            """
+            INSERT INTO recharge_requests (id, user_id, username, amount, receipt_file_id, status, created_at)
+            SELECT id, user_id, username, amount, receipt_file_id, status, created_at
+            FROM recharge_requests_old
+            """
+        )
+        await db.execute("DROP TABLE recharge_requests_old")
+
+        await db.execute("ALTER TABLE sales RENAME TO sales_old")
+        await db.execute(
+            """
+            CREATE TABLE sales (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                username TEXT,
+                config_id INTEGER,
+                model TEXT,
+                title TEXT,
+                price INTEGER,
+                purchased_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE SET NULL,
+                FOREIGN KEY(config_id) REFERENCES configs(id) ON DELETE SET NULL
+            )
+            """
+        )
+        await db.execute(
+            """
+            INSERT INTO sales (id, user_id, username, config_id, model, title, price, purchased_at)
+            SELECT id, user_id, username, config_id, model, title, price, purchased_at
+            FROM sales_old
+            """
+        )
+        await db.execute("DROP TABLE sales_old")
+
+        await db.execute("ALTER TABLE config_items RENAME TO config_items_old")
+        await db.execute(
+            """
+            CREATE TABLE config_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                config_id INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                is_used INTEGER DEFAULT 0,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(config_id) REFERENCES configs(id) ON DELETE CASCADE
+            )
+            """
+        )
+        await db.execute(
+            """
+            INSERT INTO config_items (id, config_id, content, is_used, created_at)
+            SELECT id, config_id, content, is_used, created_at
+            FROM config_items_old
+            """
+        )
+        await db.execute("DROP TABLE config_items_old")
+
+        await db.execute("PRAGMA foreign_keys = ON")
+        await self._set_migration_meta(db, "fk_v2_zero_loss_applied", "1")
+        await self._insert_migration_audit(
+            db,
+            table_name="schema",
+            record_id="fk_v2_zero_loss_applied",
+            action="migration_applied",
+            old_value="0",
+            new_value="1",
+        )
+
+    async def initialize(self, dry_run: bool = False):
+        if dry_run:
+            return await self._dry_run_report()
+
+        async with self._connect() as db:
             await db.execute(
                 """
                 CREATE TABLE IF NOT EXISTS users (
@@ -46,7 +374,8 @@ class DatabaseHandler:
                     amount INTEGER NOT NULL,
                     type TEXT NOT NULL CHECK(type IN ('recharge', 'purchase')),
                     description TEXT,
-                    timestamp TEXT NOT NULL DEFAULT (datetime('now'))
+                    timestamp TEXT NOT NULL DEFAULT (datetime('now')),
+                    FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
                 )
                 """
             )
@@ -77,7 +406,8 @@ class DatabaseHandler:
                     receipt_file_id TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'pending'
                         CHECK(status IN ('pending', 'approved', 'rejected')),
-                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
                 )
                 """
             )
@@ -91,7 +421,9 @@ class DatabaseHandler:
                     model TEXT,
                     title TEXT,
                     price INTEGER,
-                    purchased_at TEXT DEFAULT CURRENT_TIMESTAMP
+                    purchased_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE SET NULL,
+                    FOREIGN KEY(config_id) REFERENCES configs(id) ON DELETE SET NULL
                 )
                 """
             )
@@ -102,7 +434,8 @@ class DatabaseHandler:
                     config_id INTEGER NOT NULL,
                     content TEXT NOT NULL,
                     is_used INTEGER DEFAULT 0,
-                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(config_id) REFERENCES configs(id) ON DELETE CASCADE
                 )
                 """
             )
@@ -239,10 +572,76 @@ class DatabaseHandler:
                 VALUES ('referral_reward_amount', '2000')
                 """
             )
+            await db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_configs_category_sold_id
+                ON configs(category, is_sold, id)
+                """
+            )
+            await db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_configs_model_active_sold_stock_id
+                ON configs(model, is_active, is_sold, stock, id)
+                """
+            )
+            await db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_configs_sold_to_sold_at_id
+                ON configs(sold_to, sold_at DESC, id DESC)
+                """
+            )
+            await db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_config_items_cfg_used_id
+                ON config_items(config_id, is_used, id)
+                """
+            )
+            await db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_sales_purchased_at
+                ON sales(purchased_at DESC)
+                """
+            )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS __migration_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+                """
+            )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS config_items_quarantine (
+                    original_id INTEGER NOT NULL,
+                    config_id INTEGER,
+                    content TEXT NOT NULL,
+                    created_at TEXT,
+                    reason TEXT NOT NULL,
+                    migrated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                )
+                """
+            )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS migration_audit (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    table_name TEXT NOT NULL,
+                    record_id TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    old_value TEXT,
+                    new_value TEXT,
+                    migrated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                )
+                """
+            )
+
+            await self._run_fk_v2_zero_loss_migration(db)
+
             await db.commit()
 
     async def get_setting(self, key: str, default: str | None = None) -> str | None:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             async with db.execute(
                 "SELECT value FROM settings WHERE key = ?",
                 (key,),
@@ -251,7 +650,7 @@ class DatabaseHandler:
                 return row[0] if row else default
 
     async def set_setting(self, key: str, value: str) -> None:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 """
                 INSERT INTO settings (key, value)
@@ -266,7 +665,7 @@ class DatabaseHandler:
         await self.set_setting(key, value)
 
     async def get_payment_settings(self) -> tuple[str, str]:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             async with db.execute(
                 """
                 SELECT card_number, card_holder_name
@@ -281,7 +680,7 @@ class DatabaseHandler:
                 return str(row[0] or ""), str(row[1] or "")
 
     async def set_payment_card_number(self, card_number: str) -> None:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 """
                 INSERT INTO payment_settings (id, card_number, card_holder_name)
@@ -293,7 +692,7 @@ class DatabaseHandler:
             await db.commit()
 
     async def set_payment_card_holder_name(self, card_holder_name: str) -> None:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 """
                 INSERT INTO payment_settings (id, card_number, card_holder_name)
@@ -311,7 +710,7 @@ class DatabaseHandler:
         amount: int,
         receipt_file_id: str,
     ) -> int:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             cursor = await db.execute(
                 """
                 INSERT INTO recharge_requests (user_id, username, amount, receipt_file_id, status, created_at)
@@ -326,7 +725,7 @@ class DatabaseHandler:
         self,
         request_id: int,
     ) -> tuple[int, int, str | None, int, str, str, str] | None:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             async with db.execute(
                 """
                 SELECT id, user_id, username, amount, receipt_file_id, status, created_at
@@ -354,7 +753,7 @@ class DatabaseHandler:
         request_id: int,
         approved_amount: int | None = None,
     ) -> tuple[bool, int | None, int | None]:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             try:
                 await db.execute("BEGIN IMMEDIATE")
                 async with db.execute(
@@ -408,7 +807,7 @@ class DatabaseHandler:
                 raise
 
     async def reject_recharge_request(self, request_id: int) -> tuple[bool, int | None]:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             try:
                 await db.execute("BEGIN IMMEDIATE")
                 async with db.execute(
@@ -474,7 +873,7 @@ class DatabaseHandler:
         """
         params.extend([safe_limit, offset])
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             async with db.execute(query, tuple(params)) as cursor:
                 rows = await cursor.fetchall()
                 return [
@@ -510,13 +909,13 @@ class DatabaseHandler:
 
         where_sql = f"WHERE {' AND '.join(filters)}" if filters else ""
         query = f"SELECT COUNT(*) FROM recharge_requests {where_sql}"
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             async with db.execute(query, tuple(params)) as cursor:
                 row = await cursor.fetchone()
                 return int(row[0]) if row else 0
 
     async def get_pending_recharge_count(self) -> int:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             async with db.execute(
                 "SELECT COUNT(*) FROM recharge_requests WHERE status = 'pending'"
             ) as cursor:
@@ -524,7 +923,7 @@ class DatabaseHandler:
                 return int(row[0]) if row else 0
 
     async def get_recharge_stats_today_and_total(self) -> dict[str, int]:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             async with db.execute(
                 """
                 SELECT
@@ -544,7 +943,7 @@ class DatabaseHandler:
                 }
 
     async def add_user_if_not_exists(self, user_id: int) -> None:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 "INSERT OR IGNORE INTO users (user_id) VALUES (?)",
                 (user_id,),
@@ -552,7 +951,7 @@ class DatabaseHandler:
             await db.commit()
 
     async def add_user_with_referrer(self, user_id: int, referred_by: int | None = None) -> None:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 "INSERT OR IGNORE INTO users (user_id, referred_by) VALUES (?, ?)",
                 (user_id, referred_by),
@@ -560,7 +959,7 @@ class DatabaseHandler:
             await db.commit()
 
     async def user_exists(self, user_id: int) -> bool:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             async with db.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,)) as cursor:
                 return await cursor.fetchone() is not None
 
@@ -568,18 +967,22 @@ class DatabaseHandler:
         await self.add_user_if_not_exists(user_id)
 
     async def get_user_balance(self, user_id: int) -> int:
-        await self.add_user_if_not_exists(user_id)
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
+            await db.execute(
+                "INSERT OR IGNORE INTO users (user_id) VALUES (?)",
+                (user_id,),
+            )
             async with db.execute(
                 "SELECT balance FROM users WHERE user_id = ?",
                 (user_id,),
             ) as cursor:
                 row = await cursor.fetchone()
-                return row[0] if row else 0
+            await db.commit()
+            return int(row[0]) if row else 0
 
     async def update_balance(self, user_id: int, amount: int) -> None:
         await self.add_user_if_not_exists(user_id)
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 "UPDATE users SET balance = balance + ? WHERE user_id = ?",
                 (amount, user_id),
@@ -590,7 +993,7 @@ class DatabaseHandler:
         await self.update_balance(user_id, amount)
 
     async def add_config(self, content: str, category: str):
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 "INSERT OR IGNORE INTO categories (name) VALUES (?)",
                 (category,),
@@ -605,7 +1008,7 @@ class DatabaseHandler:
             await db.commit()
 
     async def get_stock_count(self) -> list[tuple[str, int]]:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             async with db.execute(
                 """
                 SELECT category, COUNT(*)
@@ -618,7 +1021,7 @@ class DatabaseHandler:
                 return await cursor.fetchall()
 
     async def get_all_categories_with_details(self) -> list[tuple[int, str, int, int]]:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             async with db.execute(
                 """
                 SELECT
@@ -637,7 +1040,7 @@ class DatabaseHandler:
                 return await cursor.fetchall()
 
     async def set_category_price(self, name: str, price: int) -> None:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 """
                 INSERT INTO categories (name, price)
@@ -649,7 +1052,7 @@ class DatabaseHandler:
             await db.commit()
 
     async def get_category_details(self, category_id: int) -> tuple[int, str, int, int] | None:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             async with db.execute(
                 """
                 SELECT
@@ -669,7 +1072,7 @@ class DatabaseHandler:
                 return await cursor.fetchone()
 
     async def get_available_config(self, category_name: str) -> tuple[int, str] | None:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             async with db.execute(
                 """
                 SELECT id, config_content
@@ -684,7 +1087,7 @@ class DatabaseHandler:
 
     async def complete_purchase(self, user_id: int, config_id: int, price: int) -> bool:
         await self.add_user_if_not_exists(user_id)
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             try:
                 await db.execute("BEGIN IMMEDIATE")
 
@@ -741,7 +1144,7 @@ class DatabaseHandler:
 
     async def add_transaction(self, user_id: int, amount: int, txn_type: str, description: str) -> None:
         await self.add_user_if_not_exists(user_id)
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 """
                 INSERT INTO transactions (user_id, amount, type, description, timestamp)
@@ -752,7 +1155,7 @@ class DatabaseHandler:
             await db.commit()
 
     async def get_user_purchases(self, user_id: int) -> list[tuple[int, str, str, str]]:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             async with db.execute(
                 """
                 SELECT id, category, config_content, COALESCE(sold_at, datetime('now'))
@@ -765,7 +1168,7 @@ class DatabaseHandler:
                 return await cursor.fetchall()
 
     async def get_user_services(self, user_id: int) -> list[dict[str, object]]:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             async with db.execute(
                 """
                 SELECT id, title, category, config_content, duration, sold_at
@@ -843,7 +1246,7 @@ class DatabaseHandler:
         ]
 
     async def get_admin_stats(self) -> dict[str, int]:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             async with db.execute("SELECT COUNT(*) FROM users") as cursor:
                 users_count_row = await cursor.fetchone()
             async with db.execute(
@@ -895,19 +1298,19 @@ class DatabaseHandler:
         return result
 
     async def get_all_users_count(self) -> int:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             async with db.execute("SELECT COUNT(*) FROM users") as cursor:
                 row = await cursor.fetchone()
                 return int(row[0]) if row else 0
 
     async def get_all_user_ids(self) -> list[int]:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             async with db.execute("SELECT user_id FROM users ORDER BY user_id") as cursor:
                 rows = await cursor.fetchall()
                 return [int(row[0]) for row in rows]
 
     async def get_referral_count(self, user_id: int) -> int:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             async with db.execute(
                 "SELECT COUNT(*) FROM users WHERE referred_by = ?",
                 (user_id,),
@@ -916,7 +1319,7 @@ class DatabaseHandler:
                 return int(row[0]) if row else 0
 
     async def get_user_purchase_history(self, user_id: int, limit: int = 5) -> list[tuple[str, str]]:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             # This project stores purchase ownership on configs (sold_to), so we read history from there.
             async with db.execute(
                 """
@@ -932,7 +1335,7 @@ class DatabaseHandler:
                 return await cursor.fetchall()
 
     async def get_user_purchases_count(self, user_id: int) -> int:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             async with db.execute(
                 "SELECT COUNT(*) FROM configs WHERE sold_to = ?",
                 (user_id,),
@@ -941,7 +1344,7 @@ class DatabaseHandler:
                 return int(row[0]) if row else 0
 
     async def add_new_configs(self, category_name: str, configs: list[str]) -> int:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 "INSERT OR IGNORE INTO categories (name) VALUES (?)",
                 (category_name,),
@@ -968,7 +1371,7 @@ class DatabaseHandler:
         title: str,
         price: int,
     ) -> None:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 """
                 INSERT INTO sales (user_id, username, config_id, model, title, price)
@@ -979,7 +1382,7 @@ class DatabaseHandler:
             await db.commit()
 
     async def get_total_sales_amount(self) -> int:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             async with db.execute(
                 "SELECT COALESCE(SUM(price), 0) FROM sales"
             ) as cursor:
@@ -987,7 +1390,7 @@ class DatabaseHandler:
                 return int(row[0]) if row else 0
 
     async def get_today_sales_count(self) -> int:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             async with db.execute(
                 "SELECT COUNT(*) FROM sales WHERE date(purchased_at) = date('now')"
             ) as cursor:
@@ -995,7 +1398,7 @@ class DatabaseHandler:
                 return int(row[0]) if row else 0
 
     async def get_today_sales_amount(self) -> int:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             async with db.execute(
                 "SELECT COALESCE(SUM(price), 0) FROM sales WHERE date(purchased_at) = date('now')"
             ) as cursor:
@@ -1003,7 +1406,7 @@ class DatabaseHandler:
                 return int(row[0]) if row else 0
 
     async def get_latest_sales(self, limit: int = 10) -> list[tuple[str | None, str, str, int, str]]:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             async with db.execute(
                 """
                 SELECT username, model, title, price, purchased_at
@@ -1026,7 +1429,7 @@ class DatabaseHandler:
                 ]
 
     async def count_active_configs_by_model(self, model: str) -> int:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             async with db.execute(
                 """
                 SELECT COUNT(*)
@@ -1044,7 +1447,7 @@ class DatabaseHandler:
         limit: int,
         offset: int,
     ) -> list[tuple[int, str, int, str]]:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             async with db.execute(
                 """
                 SELECT id, title, price, duration
@@ -1059,7 +1462,7 @@ class DatabaseHandler:
                 return [(int(r[0]), str(r[1]), int(r[2]), str(r[3])) for r in rows]
 
     async def get_model_config_details(self, config_id: int) -> tuple[int, str, int, str, str, str] | None:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             async with db.execute(
                 """
                 SELECT id, title, price, duration, description, config_content
@@ -1076,7 +1479,7 @@ class DatabaseHandler:
 
     async def complete_model_purchase(self, user_id: int, config_id: int) -> tuple[bool, str | None]:
         await self.add_user_if_not_exists(user_id)
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             try:
                 await db.execute("BEGIN IMMEDIATE")
 
@@ -1197,7 +1600,7 @@ class DatabaseHandler:
         self,
         config_id: int,
     ) -> tuple[int, str, int, str, str, str, str, int, int, int] | None:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             async with db.execute(
                 """
                 SELECT id, title, price, duration, description, config_content, model, stock, is_active, is_sold
@@ -1224,7 +1627,7 @@ class DatabaseHandler:
                 )
 
     async def count_admin_configs(self, model: str) -> int:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             async with db.execute(
                 "SELECT COUNT(*) FROM configs WHERE model = ?",
                 (model,),
@@ -1239,7 +1642,7 @@ class DatabaseHandler:
         page_size: int,
     ) -> list[tuple[int, str, int, str, int, int]]:
         offset = max(0, (page - 1) * page_size)
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             async with db.execute(
                 """
                 SELECT id, title, price, duration, stock, is_active
@@ -1267,7 +1670,7 @@ class DatabaseHandler:
         self,
         config_id: int,
     ) -> tuple[int, str, str, int, str, str, str, int, int, str] | None:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             async with db.execute(
                 """
                 SELECT id, model, title, price, duration, speed, description, stock, is_active, config_content
@@ -1305,7 +1708,7 @@ class DatabaseHandler:
         config_content: str,
     ) -> int:
         category = "Nox Plus" if model == "nox_plus" else "Nox Multi"
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 "INSERT OR IGNORE INTO categories (name, price) VALUES (?, ?)",
                 (category, price),
@@ -1335,7 +1738,7 @@ class DatabaseHandler:
         config_items: list[str],
     ) -> int:
         category = "Nox Plus" if model == "nox_plus" else "Nox Multi"
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute("BEGIN IMMEDIATE")
             try:
                 await db.execute(
@@ -1371,7 +1774,7 @@ class DatabaseHandler:
         allowed_fields = {"title", "price", "duration", "speed", "description", "stock", "config_content"}
         if field not in allowed_fields:
             return False
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             cursor = await db.execute(
                 f"UPDATE configs SET {field} = ? WHERE id = ?",
                 (value, config_id),
@@ -1380,13 +1783,13 @@ class DatabaseHandler:
             return cursor.rowcount == 1
 
     async def delete_model_config(self, config_id: int) -> bool:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             cursor = await db.execute("DELETE FROM configs WHERE id = ?", (config_id,))
             await db.commit()
             return cursor.rowcount == 1
 
     async def toggle_model_config_active(self, config_id: int) -> tuple[bool, int | None]:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             async with db.execute(
                 "SELECT is_active FROM configs WHERE id = ?",
                 (config_id,),

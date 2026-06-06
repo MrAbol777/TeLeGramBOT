@@ -8,6 +8,7 @@ from aiogram.types import Message
 
 from database.db_handler import DatabaseHandler
 from keyboards.user_menu import build_main_menu
+from utils.security import rate_limiter
 
 logger = logging.getLogger(__name__)
 router = Router(name="start")
@@ -44,6 +45,10 @@ async def handle_start_entry(
         return
 
     user_id = message.from_user.id
+    if not rate_limiter.allow(f"start:{user_id}", 2.0):
+        await message.answer("⚠️ درخواست‌ها خیلی سریع ارسال شدند. لطفاً کمی بعد دوباره تلاش کنید.")
+        return
+
     referral_id: int | None = None
     parsed_text = start_text if start_text is not None else (message.text or "")
     start_parts = parsed_text.strip().split(maxsplit=1)
@@ -61,6 +66,10 @@ async def handle_start_entry(
 
         user_exists = await db.user_exists(user_id)
         if not user_exists:
+            if referral_id is not None:
+                ref_exists = await db.user_exists(referral_id)
+                if not ref_exists:
+                    referral_id = None
             await db.add_user_with_referrer(user_id, referral_id)
             if referral_id is not None:
                 await db.add_balance(referral_id, referral_reward_amount)

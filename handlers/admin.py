@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import html
 import logging
 
@@ -21,6 +22,7 @@ from database.db_handler import DatabaseHandler
 from keyboards.admin_menu import build_admin_menu
 from keyboards.start_menu import build_start_menu
 from utils.states import AdminServiceStates, AdminStates
+from utils.security import parse_int_callback_payload, rate_limiter
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +36,7 @@ def format_toman(amount: int) -> str:
 
 
 RECHARGE_PAGE_SIZE = 5
+BROADCAST_CONCURRENCY = 30
 CRYPTO_WALLET_KEYS: dict[str, str] = {
     "crypto_usdt_bep20": "USDT (BEP20)",
     "crypto_tron_trc20": "TRON (TRC20)",
@@ -370,6 +373,26 @@ def build_crypto_wallets_manage_keyboard() -> InlineKeyboardMarkup:
         )
     builder.row(InlineKeyboardButton(text="🔙 منوی ادمین", callback_data="admin_back:main_admin_menu"))
     return builder.as_markup()
+
+
+async def _broadcast_one(
+    bot: Bot,
+    semaphore: asyncio.Semaphore,
+    *,
+    user_id: int,
+    source_chat_id: int,
+    source_message_id: int,
+) -> bool:
+    async with semaphore:
+        try:
+            await bot.copy_message(
+                chat_id=user_id,
+                from_chat_id=source_chat_id,
+                message_id=source_message_id,
+            )
+            return True
+        except Exception:
+            return False
 
 
 async def _send_crypto_wallets_manage_panel(message: Message, db: DatabaseHandler) -> None:
@@ -786,6 +809,12 @@ async def recharge_admin_approve_handler(
     state: FSMContext,
 ) -> None:
     await callback.answer()
+    if callback.from_user is None or callback.from_user.id != settings.ADMIN_ID:
+        logger.warning("Unauthorized recharge approve attempt from user_id=%s", callback.from_user.id if callback.from_user else None)
+        return
+    if not rate_limiter.allow(f"admin_recharge_approve:{callback.from_user.id}", 1.0):
+        await callback.message.answer("⚠️ درخواست‌ها خیلی سریع ارسال شدند. لطفاً کمی بعد دوباره تلاش کنید.")
+        return
     parts = callback.data.split(":", 2)
     if len(parts) != 3 or not parts[1].isdigit():
         await callback.message.answer("⚠️ شناسه درخواست نامعتبر است.")
@@ -840,6 +869,12 @@ async def recharge_admin_approve_handler(
 @router.callback_query(F.data.startswith("recharge_admin_reject:"))
 async def recharge_admin_reject_handler(callback: CallbackQuery, db: DatabaseHandler, bot: Bot) -> None:
     await callback.answer()
+    if callback.from_user is None or callback.from_user.id != settings.ADMIN_ID:
+        logger.warning("Unauthorized recharge reject attempt from user_id=%s", callback.from_user.id if callback.from_user else None)
+        return
+    if not rate_limiter.allow(f"admin_recharge_reject:{callback.from_user.id}", 1.0):
+        await callback.message.answer("⚠️ درخواست‌ها خیلی سریع ارسال شدند. لطفاً کمی بعد دوباره تلاش کنید.")
+        return
     parts = callback.data.split(":", 2)
     if len(parts) != 3 or not parts[1].isdigit():
         await callback.message.answer("⚠️ شناسه درخواست نامعتبر است.")
@@ -1072,6 +1107,12 @@ async def confirm_broadcast_handler(
     bot: Bot,
 ) -> None:
     await callback.answer()
+    if callback.from_user is None or callback.from_user.id != settings.ADMIN_ID:
+        logger.warning("Unauthorized broadcast confirm attempt from user_id=%s", callback.from_user.id if callback.from_user else None)
+        return
+    if not rate_limiter.allow(f"admin_broadcast:{callback.from_user.id}", 10.0):
+        await callback.message.answer("⚠️ درخواست‌ها خیلی سریع ارسال شدند. لطفاً کمی بعد دوباره تلاش کنید.")
+        return
     state_data = await state.get_data()
     source_chat_id = state_data.get("broadcast_source_chat_id")
     source_message_id = state_data.get("broadcast_source_message_id")
@@ -1088,19 +1129,25 @@ async def confirm_broadcast_handler(
         await callback.message.answer("❌ دریافت لیست کاربران با خطا مواجه شد.")
         return
 
-    success_count = 0
-    failed_count = 0
-
-    for user_id in user_ids:
-        try:
-            await bot.copy_message(
-                chat_id=user_id,
-                from_chat_id=int(source_chat_id),
-                message_id=int(source_message_id),
+    source_chat = int(source_chat_id)
+    source_message = int(source_message_id)
+    semaphore = asyncio.Semaphore(BROADCAST_CONCURRENCY)
+    tasks = [
+        asyncio.create_task(
+            _broadcast_one(
+                bot,
+                semaphore,
+                user_id=user_id,
+                source_chat_id=source_chat,
+                source_message_id=source_message,
             )
-            success_count += 1
-        except Exception:
-            failed_count += 1
+        )
+        for user_id in user_ids
+    ]
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    success_count = sum(1 for item in results if item is True)
+    failed_count = len(results) - success_count
 
     await state.clear()
     await callback.message.answer(
@@ -1533,11 +1580,10 @@ async def admin_finish_collecting_configs_handler(
 async def admin_edit_config_handler(callback: CallbackQuery, db: DatabaseHandler, state: FSMContext) -> None:
     await callback.answer()
     await state.clear()
-    config_id_text = callback.data.split(":", 1)[1]
-    if not config_id_text.isdigit():
+    config_id = parse_int_callback_payload(callback.data, "admin_edit_config:")
+    if config_id is None:
         await callback.message.answer("⚠️ شناسه کانفیگ نامعتبر است.")
         return
-    config_id = int(config_id_text)
     await _send_admin_edit_config(callback.message, db, config_id)
 
 
@@ -1606,11 +1652,10 @@ async def admin_edit_field_value_handler(message: Message, state: FSMContext, db
 @router.callback_query(F.data.startswith("admin_delete_config:"))
 async def admin_delete_config_handler(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
-    config_id_text = callback.data.split(":", 1)[1]
-    if not config_id_text.isdigit():
+    config_id = parse_int_callback_payload(callback.data, "admin_delete_config:")
+    if config_id is None:
         await callback.message.answer("⚠️ شناسه کانفیگ نامعتبر است.")
         return
-    config_id = int(config_id_text)
     await state.set_state(AdminServiceStates.confirming_delete)
     await state.update_data(deleting_config_id=config_id)
 
@@ -1630,11 +1675,10 @@ async def admin_confirm_delete_handler(
     db: DatabaseHandler,
 ) -> None:
     await callback.answer()
-    config_id_text = callback.data.split(":", 1)[1]
-    if not config_id_text.isdigit():
+    config_id = parse_int_callback_payload(callback.data, "admin_confirm_delete:")
+    if config_id is None:
         await callback.message.answer("⚠️ شناسه کانفیگ نامعتبر است.")
         return
-    config_id = int(config_id_text)
     config = await db.get_config_for_admin_edit(config_id)
     model = config[1] if config else "nox_plus"
     try:
@@ -1654,11 +1698,10 @@ async def admin_confirm_delete_handler(
 @router.callback_query(F.data.startswith("admin_toggle_config:"))
 async def admin_toggle_config_handler(callback: CallbackQuery, db: DatabaseHandler) -> None:
     await callback.answer()
-    config_id_text = callback.data.split(":", 1)[1]
-    if not config_id_text.isdigit():
+    config_id = parse_int_callback_payload(callback.data, "admin_toggle_config:")
+    if config_id is None:
         await callback.message.answer("⚠️ شناسه کانفیگ نامعتبر است.")
         return
-    config_id = int(config_id_text)
     config = await db.get_config_for_admin_edit(config_id)
     if not config:
         await callback.message.answer("⚠️ کانفیگ پیدا نشد.")

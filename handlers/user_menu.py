@@ -24,6 +24,7 @@ from keyboards.shop_menu import (
     build_recharge_prompt_menu,
 )
 from utils.states import RechargeStates
+from utils.security import parse_int_callback_payload, rate_limiter
 
 logger = logging.getLogger(__name__)
 
@@ -339,6 +340,9 @@ async def recharge_method_crypto_handler(callback: CallbackQuery, state: FSMCont
 async def recharge_amount_handler(message: Message, state: FSMContext, db: DatabaseHandler) -> None:
     if message.from_user is None:
         return
+    if not rate_limiter.allow(f"recharge_amount:{message.from_user.id}", 2.0):
+        await message.answer("⚠️ درخواست‌ها خیلی سریع ارسال شدند. لطفاً کمی بعد دوباره تلاش کنید.")
+        return
 
     raw_amount = message.text.replace("٬", "").replace(",", "").strip()
     if not raw_amount.isdigit():
@@ -376,6 +380,9 @@ async def recharge_amount_handler(message: Message, state: FSMContext, db: Datab
 @router.callback_query(F.data == "buy_service")
 async def buy_service_handler(callback: CallbackQuery, db: DatabaseHandler) -> None:
     await callback.answer()
+    if callback.from_user and not rate_limiter.allow(f"buy_service:{callback.from_user.id}", 1.0):
+        await callback.message.answer("⚠️ درخواست‌ها خیلی سریع ارسال شدند. لطفاً کمی بعد دوباره تلاش کنید.")
+        return
     await callback.message.answer(
         "⬇️• یکی از مدل های زیر را انتخاب کنید",
         reply_markup=build_model_selection_menu(),
@@ -462,14 +469,10 @@ async def send_model_configs_page(message: Message, db: DatabaseHandler, model: 
 @router.callback_query(F.data.startswith("buy_config:"))
 async def buy_config_handler(callback: CallbackQuery, db: DatabaseHandler) -> None:
     await callback.answer()
-    if callback.data is None:
-        return
-    data_parts = callback.data.split(":")
-    if len(data_parts) != 2 or not data_parts[1].isdigit():
+    config_id = parse_int_callback_payload(callback.data, "buy_config:")
+    if config_id is None:
         await callback.message.answer("⚠️ درخواست نامعتبر است.")
         return
-
-    config_id = int(data_parts[1])
     try:
         config = await db.get_model_config_details(config_id)
     except Exception:
@@ -503,7 +506,10 @@ async def select_category_for_purchase(
     if callback.from_user is None:
         return
 
-    category_id = int(callback.data.split(":")[1])
+    category_id = parse_int_callback_payload(callback.data, "buy_category:")
+    if category_id is None:
+        await callback.message.answer("⚠️ درخواست نامعتبر است.")
+        return
 
     try:
         category = await db.get_category_details(category_id)
@@ -539,32 +545,36 @@ async def confirm_purchase_handler(
         return
 
     user_id = callback.from_user.id
-    payload = callback.data.split(":")[1]
+    if not rate_limiter.allow(f"confirm_purchase:{user_id}", 1.5):
+        await callback.message.answer("⚠️ درخواست‌ها خیلی سریع ارسال شدند. لطفاً کمی بعد دوباره تلاش کنید.")
+        return
+
+    data_parts = callback.data.split(":")
+    if len(data_parts) != 2:
+        await callback.message.answer("⚠️ درخواست خرید نامعتبر است.")
+        return
+    payload = data_parts[1]
     if not payload.isdigit():
         await callback.message.answer("⚠️ درخواست خرید نامعتبر است.")
         return
     target_id = int(payload)
 
     try:
-        purchase_completed, config_content = await db.complete_model_purchase(user_id, target_id)
-    except Exception:
-        logger.exception("Completing model purchase failed for user_id=%s config_id=%s", user_id, target_id)
-        purchase_completed, config_content = False, None
-
-    if purchase_completed and config_content:
-        await callback.message.answer(
-            "✅ خرید با موفقیت انجام شد\n\n"
-            "📦 سرویس شما:\n\n"
-            f"{config_content}",
-        )
-        return
-
-    try:
         category = await db.get_category_details(target_id)
+        config_snapshot = await db.get_model_config_purchase_snapshot(target_id)
         balance = await db.get_user_balance(user_id)
     except Exception:
         logger.exception("Loading purchase data failed for user_id=%s category_id=%s", user_id, target_id)
         await callback.message.answer("❌ بررسی اطلاعات خرید با خطا مواجه شد.")
+        return
+
+    if category is None and config_snapshot is not None:
+        logger.warning(
+            "Rejected mixed purchase flow for user_id=%s target_id=%s (config id used in category flow)",
+            user_id,
+            target_id,
+        )
+        await callback.message.answer("⚠️ درخواست خرید نامعتبر است.")
         return
 
     if category is None:
@@ -572,40 +582,17 @@ async def confirm_purchase_handler(
         return
 
     _, category_name, price, _ = category
-    if balance < price:
-        await callback.message.answer(
-            f"❌ موجودی کیف پول شما کافی نیست.\n"
-            f"💰 قیمت سرویس: {price:,} تومان\n"
-            f"💳 موجودی فعلی: {balance:,} تومان".replace(",", "٬"),
-            reply_markup=build_recharge_prompt_menu(),
-        )
-        return
-
-    try:
-        available_config = await db.get_available_config(category_name)
-    except Exception:
-        logger.exception("Fetching available config failed for category=%s", category_name)
-        await callback.message.answer("❌ دریافت کانفیگ با خطا مواجه شد.")
-        return
-
-    if available_config is None:
-        await callback.message.answer("⚠️ متاسفانه موجودی این سرویس تمام شده است.")
-        return
-
-    config_id, config_content = available_config
-
-    try:
-        purchase_completed = await db.complete_purchase(user_id, config_id, price)
-    except Exception:
-        logger.exception("Completing purchase failed for user_id=%s config_id=%s", user_id, config_id)
-        await callback.message.answer("❌ انجام خرید با خطا مواجه شد. دوباره تلاش کنید.")
-        return
-
+    config_id, config_content, purchase_completed = await _complete_category_purchase(
+        callback=callback,
+        db=db,
+        user_id=user_id,
+        category_name=category_name,
+        price=price,
+        balance=balance,
+    )
     if not purchase_completed:
-        await callback.message.answer(
-            "⚠️ خرید انجام نشد؛ ممکن است موجودی کیف پول یا انبار تغییر کرده باشد. دوباره تلاش کنید."
-        )
         return
+
 
     try:
         new_balance = await db.get_user_balance(user_id)
@@ -631,6 +618,51 @@ async def confirm_purchase_handler(
         await callback.message.answer("⚠️ خرید انجام شد، اما ارسال نتیجه با خطا مواجه شد.")
 
 
+async def _complete_category_purchase(
+    callback: CallbackQuery,
+    db: DatabaseHandler,
+    *,
+    user_id: int,
+    category_name: str,
+    price: int,
+    balance: int,
+) -> tuple[int | None, str | None, bool]:
+    if balance < price:
+        await callback.message.answer(
+            f"❌ موجودی کیف پول شما کافی نیست.\n"
+            f"💰 قیمت سرویس: {price:,} تومان\n"
+            f"💳 موجودی فعلی: {balance:,} تومان".replace(",", "٬"),
+            reply_markup=build_recharge_prompt_menu(),
+        )
+        return None, None, False
+
+    try:
+        available_config = await db.get_available_config(category_name)
+    except Exception:
+        logger.exception("Fetching available config failed for category=%s", category_name)
+        await callback.message.answer("❌ دریافت کانفیگ با خطا مواجه شد.")
+        return None, None, False
+
+    if available_config is None:
+        await callback.message.answer("⚠️ متاسفانه موجودی این سرویس تمام شده است.")
+        return None, None, False
+
+    config_id, config_content = available_config
+    try:
+        purchase_completed = await db.complete_purchase(user_id, config_id, price)
+    except Exception:
+        logger.exception("Completing purchase failed for user_id=%s config_id=%s", user_id, config_id)
+        await callback.message.answer("❌ انجام خرید با خطا مواجه شد. دوباره تلاش کنید.")
+        return None, None, False
+
+    if not purchase_completed:
+        await callback.message.answer(
+            "⚠️ خرید انجام نشد؛ ممکن است موجودی کیف پول یا انبار تغییر کرده باشد. دوباره تلاش کنید."
+        )
+        return None, None, False
+    return config_id, config_content, True
+
+
 @router.callback_query(F.data.startswith("confirm_buy:"))
 async def confirm_buy_handler(callback: CallbackQuery, db: DatabaseHandler) -> None:
     await callback.answer()
@@ -644,6 +676,10 @@ async def confirm_buy_handler(callback: CallbackQuery, db: DatabaseHandler) -> N
         return
 
     user_id = callback.from_user.id
+    if not rate_limiter.allow(f"confirm_buy:{user_id}", 1.5):
+        await callback.message.answer("⚠️ درخواست‌ها خیلی سریع ارسال شدند. لطفاً کمی بعد دوباره تلاش کنید.")
+        return
+
     config_id = int(parts[1])
 
     try:
@@ -765,9 +801,7 @@ async def my_services_menu_handler(callback: CallbackQuery, db: DatabaseHandler)
         lines.append("")
 
     text = "\n".join(lines).strip()
-    print("DEBUG MESSAGE:")
-    print(text)
-    print("LENGTH:", len(text))
+    logger.debug("Prepared my services message for user_id=%s length=%s", user_id, len(text))
 
     chunks = _chunk_message(text)
     for index, chunk in enumerate(chunks):
@@ -784,7 +818,10 @@ async def purchase_info_handler(callback: CallbackQuery, db: DatabaseHandler) ->
     if callback.from_user is None:
         return
 
-    config_id = int(callback.data.split(":")[1])
+    config_id = parse_int_callback_payload(callback.data, "purchase_info:")
+    if config_id is None:
+        await callback.message.answer("⚠️ درخواست نامعتبر است.")
+        return
 
     try:
         purchases = await db.get_user_purchases(callback.from_user.id)
@@ -820,6 +857,10 @@ async def receipt_photo_handler(
         return
 
     user = message.from_user
+    if not rate_limiter.allow(f"receipt_photo:{user.id}", 5.0):
+        await message.answer("⚠️ درخواست‌ها خیلی سریع ارسال شدند. لطفاً کمی بعد دوباره تلاش کنید.")
+        return
+
     state_data = await state.get_data()
     amount = int(state_data.get("recharge_amount", 0))
     if amount <= 0:
@@ -867,6 +908,9 @@ async def crypto_proof_photo_handler(
     if message.from_user is None:
         return
     user = message.from_user
+    if not rate_limiter.allow(f"crypto_proof_photo:{user.id}", 5.0):
+        await message.answer("⚠️ درخواست‌ها خیلی سریع ارسال شدند. لطفاً کمی بعد دوباره تلاش کنید.")
+        return
     try:
         await db.add_user_if_not_exists(user.id)
         request_id = await db.create_recharge_request(
@@ -904,6 +948,9 @@ async def crypto_proof_text_handler(
     db: DatabaseHandler,
 ) -> None:
     if message.from_user is None:
+        return
+    if not rate_limiter.allow(f"crypto_proof_text:{message.from_user.id}", 5.0):
+        await message.answer("⚠️ درخواست‌ها خیلی سریع ارسال شدند. لطفاً کمی بعد دوباره تلاش کنید.")
         return
     proof_hash = _sanitize_crypto_proof_text(message.text)
     if len(proof_hash) < 8:

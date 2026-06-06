@@ -34,6 +34,8 @@ def get_deep_link_url() -> str:
 
 
 def _log_file_freshness_detail(max_age_seconds: int = 300) -> tuple[bool, str]:
+    if not LOG_FILE_PATH:
+        return False, "مسیر لاگ تنظیم نشده است."
     log_path = Path(LOG_FILE_PATH)
     if not log_path.exists():
         return False, f"فایل لاگ پیدا نشد: {log_path}"
@@ -99,6 +101,8 @@ async def health_check() -> bool:
 
 
 def read_last_log_error() -> str:
+    if not LOG_FILE_PATH:
+        return "مسیر لاگ تنظیم نشده است."
     log_path = Path(LOG_FILE_PATH)
     if not log_path.exists():
         return "فایل لاگ پیدا نشد."

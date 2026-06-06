@@ -290,6 +290,8 @@ async def ignore_non_admin(message: Message) -> None:
 async def main() -> None:
     if not TOKEN:
         raise ValueError("TOKEN در config.py خالی است. لطفاً مقداردهی کنید.")
+    if ADMIN_ID <= 0:
+        raise ValueError("UPTIME_ADMIN_ID تنظیم نشده یا نامعتبر است.")
 
     logging.basicConfig(
         level=logging.INFO,
