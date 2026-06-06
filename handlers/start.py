@@ -33,14 +33,20 @@ async def send_main_menu(message: Message) -> None:
     )
 
 
-@router.message(CommandStart())
-async def start_handler(message: Message, db: DatabaseHandler, bot: Bot) -> None:
+async def handle_start_entry(
+    message: Message,
+    db: DatabaseHandler,
+    bot: Bot,
+    *,
+    start_text: str | None = None,
+) -> None:
     if message.from_user is None:
         return
 
     user_id = message.from_user.id
     referral_id: int | None = None
-    start_parts = (message.text or "").strip().split(maxsplit=1)
+    parsed_text = start_text if start_text is not None else (message.text or "")
+    start_parts = parsed_text.strip().split(maxsplit=1)
     if len(start_parts) > 1 and start_parts[1].isdigit():
         parsed_ref_id = int(start_parts[1])
         if parsed_ref_id != user_id:
@@ -73,3 +79,8 @@ async def start_handler(message: Message, db: DatabaseHandler, bot: Bot) -> None
         return
 
     await send_main_menu(message)
+
+
+@router.message(CommandStart())
+async def start_handler(message: Message, db: DatabaseHandler, bot: Bot) -> None:
+    await handle_start_entry(message, db, bot, start_text=message.text)

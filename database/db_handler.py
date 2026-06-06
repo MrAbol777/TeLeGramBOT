@@ -757,7 +757,7 @@ class DatabaseHandler:
                 """
                 SELECT id, category, config_content, COALESCE(sold_at, datetime('now'))
                 FROM configs
-                WHERE is_sold = 1 AND sold_to = ?
+                WHERE sold_to = ?
                 ORDER BY sold_at DESC, id DESC
                 """,
                 (user_id,),
@@ -770,7 +770,7 @@ class DatabaseHandler:
                 """
                 SELECT id, title, category, config_content, duration, sold_at
                 FROM configs
-                WHERE is_sold = 1 AND sold_to = ?
+                WHERE sold_to = ?
                 ORDER BY sold_at DESC, id DESC
                 """,
                 (user_id,),
@@ -923,7 +923,7 @@ class DatabaseHandler:
                 SELECT cat.name, cfg.config_content
                 FROM configs cfg
                 LEFT JOIN categories cat ON cat.name = cfg.category
-                WHERE cfg.sold_to = ? AND cfg.is_sold = 1
+                WHERE cfg.sold_to = ?
                 ORDER BY cfg.sold_at DESC, cfg.id DESC
                 LIMIT ?
                 """,
@@ -934,7 +934,7 @@ class DatabaseHandler:
     async def get_user_purchases_count(self, user_id: int) -> int:
         async with aiosqlite.connect(self.db_path) as db:
             async with db.execute(
-                "SELECT COUNT(*) FROM configs WHERE sold_to = ? AND is_sold = 1",
+                "SELECT COUNT(*) FROM configs WHERE sold_to = ?",
                 (user_id,),
             ) as cursor:
                 row = await cursor.fetchone()

@@ -6,14 +6,14 @@ import re
 
 from aiogram import Bot, F, Router
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, InlineKeyboardButton, Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from config import settings
 from database.db_handler import DatabaseHandler
 from keyboards.user_menu import build_main_menu
 from keyboards.user_menu import build_recharge_method_menu
-from handlers.start import send_main_menu
+from handlers.start import handle_start_entry
 from keyboards.shop_menu import (
     build_model_configs_menu,
     build_insufficient_balance_menu,
@@ -79,7 +79,7 @@ def build_my_services_actions_keyboard() -> InlineKeyboardMarkup:
         "icon_custom_emoji_id": "5443127283898405358",
     }
     back_payload = {
-        "text": "بازگشت",
+        "text": "🔙 بازگشت به منوی اصلی",
         "callback_data": "main_menu",
         "icon_custom_emoji_id": "5372926953978341366",
     }
@@ -139,7 +139,7 @@ async def connection_guide_handler(callback: CallbackQuery) -> None:
     )
 
     keyboard = InlineKeyboardBuilder()
-    keyboard.button(text="🔙 بازگشت", callback_data="main_menu")
+    keyboard.button(text="🔙 بازگشت به منوی اصلی", callback_data="main_menu")
 
     await callback.message.edit_text(
         text=guide_text,
@@ -149,10 +149,10 @@ async def connection_guide_handler(callback: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data == "main_menu")
-async def main_menu_handler(callback: CallbackQuery, state: FSMContext) -> None:
+async def main_menu_handler(callback: CallbackQuery, state: FSMContext, db: DatabaseHandler, bot: Bot) -> None:
     await state.clear()
     await callback.answer()
-    await send_main_menu(callback.message)
+    await handle_start_entry(callback.message, db, bot, start_text="/start")
 
 
 @router.callback_query(F.data == "user_profile")
@@ -352,15 +352,22 @@ async def recharge_amount_handler(message: Message, state: FSMContext, db: Datab
         )
         return
 
-    card_number, _card_holder_name = await db.get_payment_settings()
+    card_number, card_holder_name = await db.get_payment_settings()
     if not card_number:
         card_number = settings.ADMIN_CARD_NUMBER
+
+    holder_line = (
+        f"<tg-emoji emoji-id='5278611606756942667'>👤</tg-emoji> • نام صاحب کارت: {html.escape(card_holder_name)}\n\n"
+        if card_holder_name
+        else ""
+    )
 
     await state.update_data(recharge_amount=amount)
     await state.set_state(RechargeStates.waiting_for_receipt)
     await message.answer(
         f"<tg-emoji emoji-id='5445353829304387411'>💳</tg-emoji> • برای شارژ حساب، مبلغ {amount} تومان را به شماره کارت زیر واریز کنید:\n\n"
         f"<code>{html.escape(card_number)}</code>\n\n"
+        f"{holder_line}"
         "<tg-emoji emoji-id='5431515281467917094'>🎥</tg-emoji> • سپس عکس فیش واریزی را همین‌جا ارسال کنید.",
         parse_mode="HTML",
     )
