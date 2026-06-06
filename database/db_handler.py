@@ -356,6 +356,17 @@ class DatabaseHandler:
         if backfill_done:
             return
 
+        valid_user_ids: set[int] = set()
+        valid_config_ids: set[int] = set()
+        async with db.execute("SELECT user_id FROM users") as cursor:
+            for row in await cursor.fetchall():
+                if row and row[0] is not None:
+                    valid_user_ids.add(int(row[0]))
+        async with db.execute("SELECT id FROM configs") as cursor:
+            for row in await cursor.fetchall():
+                if row and row[0] is not None:
+                    valid_config_ids.add(int(row[0]))
+
         async with db.execute(
             """
             SELECT user_id, amount, description, timestamp
@@ -367,15 +378,23 @@ class DatabaseHandler:
             tx_rows = await cursor.fetchall()
 
         for user_id_raw, amount_raw, description_raw, timestamp_raw in tx_rows:
-            user_id = int(user_id_raw)
-            amount = int(amount_raw or 0)
-            description = str(description_raw or "")
-            purchased_at = str(timestamp_raw or "")
+            try:
+                user_id = int(user_id_raw)
+                if user_id not in valid_user_ids:
+                    continue
+                amount = int(amount_raw or 0)
+                description = str(description_raw or "")
+                purchased_at = str(timestamp_raw or "")
+            except Exception as exc:
+                print(f"[db] user_services backfill skipped broken transaction row: {exc}")
+                continue
 
             config_id: int | None = None
             match = re.search(r"config_id=(\d+)", description)
             if match:
                 config_id = int(match.group(1))
+                if config_id not in valid_config_ids:
+                    config_id = None
 
             title = "سرویس"
             category = "نامشخص"
@@ -428,7 +447,7 @@ class DatabaseHandler:
             if exists:
                 continue
 
-            await self.add_user_service_record(
+            await self.safe_insert_user_service(
                 db=db,
                 user_id=user_id,
                 config_id=config_id,
@@ -439,6 +458,8 @@ class DatabaseHandler:
                 duration=duration,
                 config_content=config_content,
                 purchased_at=purchased_at,
+                valid_user_ids=valid_user_ids,
+                valid_config_ids=valid_config_ids,
             )
 
         async with db.execute(
@@ -454,15 +475,23 @@ class DatabaseHandler:
             legacy_rows = await cursor.fetchall()
 
         for row in legacy_rows:
-            user_id = int(row[0])
-            config_id = int(row[1])
-            title = str(row[2] or row[3] or "سرویس")
-            category = str(row[3] or "نامشخص")
-            model = str(row[4] or "")
-            price = int(row[5] or 0)
-            duration = str(row[6] or "نامشخص")
-            config_content = str(row[7] or "")
-            purchased_at = str(row[8] or "")
+            try:
+                user_id = int(row[0])
+                if user_id not in valid_user_ids:
+                    continue
+                config_id = int(row[1]) if row[1] is not None else None
+                if config_id is not None and config_id not in valid_config_ids:
+                    config_id = None
+                title = str(row[2] or row[3] or "سرویس")
+                category = str(row[3] or "نامشخص")
+                model = str(row[4] or "")
+                price = int(row[5] or 0)
+                duration = str(row[6] or "نامشخص")
+                config_content = str(row[7] or "")
+                purchased_at = str(row[8] or "")
+            except Exception as exc:
+                print(f"[db] user_services backfill skipped broken legacy row: {exc}")
+                continue
 
             async with db.execute(
                 """
@@ -480,7 +509,7 @@ class DatabaseHandler:
             if exists:
                 continue
 
-            await self.add_user_service_record(
+            await self.safe_insert_user_service(
                 db=db,
                 user_id=user_id,
                 config_id=config_id,
@@ -491,6 +520,8 @@ class DatabaseHandler:
                 duration=duration,
                 config_content=config_content,
                 purchased_at=purchased_at,
+                valid_user_ids=valid_user_ids,
+                valid_config_ids=valid_config_ids,
             )
 
         await self._set_migration_meta(db, "user_services_backfilled_v1", "1")
@@ -823,7 +854,10 @@ class DatabaseHandler:
             )
 
             await self._run_fk_v2_zero_loss_migration(db)
-            await self._backfill_user_services_from_transactions(db)
+            try:
+                await self._backfill_user_services_from_transactions(db)
+            except Exception as exc:
+                print(f"[db] user_services backfill failed safely during initialize: {exc}")
 
             await db.commit()
 
@@ -1381,14 +1415,37 @@ class DatabaseHandler:
         duration: str,
         config_content: str,
         purchased_at: str | None = None,
-    ) -> None:
-        if purchased_at:
+        suppress_errors: bool = False,
+    ) -> bool:
+        try:
+            if purchased_at:
+                await db.execute(
+                    """
+                    INSERT INTO user_services (
+                        user_id, config_id, title, category, model, price, duration, config_content, purchased_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        user_id,
+                        config_id,
+                        title,
+                        category,
+                        model,
+                        price,
+                        duration,
+                        config_content,
+                        purchased_at,
+                    ),
+                )
+                return True
+
             await db.execute(
                 """
                 INSERT INTO user_services (
                     user_id, config_id, title, category, model, price, duration, config_content, purchased_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
                 """,
                 (
                     user_id,
@@ -1399,28 +1456,67 @@ class DatabaseHandler:
                     price,
                     duration,
                     config_content,
-                    purchased_at,
                 ),
             )
-            return
+            return True
+        except Exception as exc:
+            if suppress_errors:
+                print(f"[db] add_user_service_record skipped row: {exc}")
+                return False
+            raise
 
-        await db.execute(
-            """
-            INSERT INTO user_services (
-                user_id, config_id, title, category, model, price, duration, config_content, purchased_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-            """,
-            (
-                user_id,
-                config_id,
-                title,
-                category,
-                model,
-                price,
-                duration,
-                config_content,
-            ),
+    async def safe_insert_user_service(
+        self,
+        *,
+        db,
+        user_id: int,
+        config_id: int | None,
+        title: str,
+        category: str,
+        model: str,
+        price: int,
+        duration: str,
+        config_content: str,
+        purchased_at: str | None = None,
+        valid_user_ids: set[int] | None = None,
+        valid_config_ids: set[int] | None = None,
+    ) -> bool:
+        if valid_user_ids is not None:
+            user_exists = user_id in valid_user_ids
+        else:
+            async with db.execute(
+                "SELECT 1 FROM users WHERE user_id = ? LIMIT 1",
+                (user_id,),
+            ) as cursor:
+                user_exists = await cursor.fetchone() is not None
+        if not user_exists:
+            return False
+
+        safe_config_id = config_id
+        if safe_config_id is not None:
+            if valid_config_ids is not None:
+                config_exists = safe_config_id in valid_config_ids
+            else:
+                async with db.execute(
+                    "SELECT 1 FROM configs WHERE id = ? LIMIT 1",
+                    (safe_config_id,),
+                ) as cursor:
+                    config_exists = await cursor.fetchone() is not None
+            if not config_exists:
+                safe_config_id = None
+
+        return await self.add_user_service_record(
+            db=db,
+            user_id=user_id,
+            config_id=safe_config_id,
+            title=title,
+            category=category,
+            model=model,
+            price=price,
+            duration=duration,
+            config_content=config_content,
+            purchased_at=purchased_at,
+            suppress_errors=True,
         )
 
     async def get_user_purchases(self, user_id: int) -> list[tuple[int, str, str, str]]:
