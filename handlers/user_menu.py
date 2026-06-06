@@ -793,9 +793,20 @@ async def my_services_menu_handler(callback: CallbackQuery, db: DatabaseHandler)
     lines = [f"📝 تعداد کل سرویس‌ها: {len(services)}", ""]
     for index, service in enumerate(services[:15], start=1):
         service_name = _normalize_service_text(service.get("name", "سرویس"))
+        category = _normalize_service_text(service.get("category", ""))
+        model = _normalize_service_text(service.get("model", ""))
+        price = int(service.get("price", 0) or 0)
+        purchased_at = _normalize_service_text(service.get("purchased_at", "نامشخص"))
         expires_at = _normalize_service_text(service.get("expires_at", "نامشخص"))
         config_link = _normalize_service_text(service.get("config_link", ""))
         lines.append(f"{index}) {service_name}")
+        if category:
+            lines.append(f"📦 دسته‌بندی: {category}")
+        if model:
+            lines.append(f"🧩 مدل: {model}")
+        if price > 0:
+            lines.append(f"💰 مبلغ خرید: {format_toman(price)} تومان")
+        lines.append(f"🕒 زمان خرید: {purchased_at}")
         lines.append(f"⏳ انقضا: {expires_at}")
         lines.append(f"<code>{config_link or '—'}</code>")
         lines.append("")

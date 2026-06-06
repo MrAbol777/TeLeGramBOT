@@ -102,6 +102,18 @@ class DatabaseHandler:
                 for row in rows:
                     if row and row[0] is not None:
                         missing.add(int(row[0]))
+        async with db.execute(
+            """
+            SELECT DISTINCT us.user_id
+            FROM user_services us
+            LEFT JOIN users u ON u.user_id = us.user_id
+            WHERE u.user_id IS NULL
+            """
+        ) as cursor:
+            rows = await cursor.fetchall()
+            for row in rows:
+                if row and row[0] is not None:
+                    missing.add(int(row[0]))
         return sorted(missing)
 
     async def _collect_missing_config_ids(self, db) -> list[int]:
@@ -118,6 +130,12 @@ class DatabaseHandler:
             FROM sales s
             LEFT JOIN configs c ON c.id = s.config_id
             WHERE s.config_id IS NOT NULL AND c.id IS NULL
+            """,
+            """
+            SELECT DISTINCT us.config_id
+            FROM user_services us
+            LEFT JOIN configs c ON c.id = us.config_id
+            WHERE us.config_id IS NOT NULL AND c.id IS NULL
             """,
         ]
         for query in queries:
@@ -333,6 +351,150 @@ class DatabaseHandler:
             new_value="1",
         )
 
+    async def _backfill_user_services_from_transactions(self, db) -> None:
+        backfill_done = (await self._get_migration_meta(db, "user_services_backfilled_v1")) == "1"
+        if backfill_done:
+            return
+
+        async with db.execute(
+            """
+            SELECT user_id, amount, description, timestamp
+            FROM transactions
+            WHERE type = 'purchase'
+            ORDER BY id
+            """
+        ) as cursor:
+            tx_rows = await cursor.fetchall()
+
+        for user_id_raw, amount_raw, description_raw, timestamp_raw in tx_rows:
+            user_id = int(user_id_raw)
+            amount = int(amount_raw or 0)
+            description = str(description_raw or "")
+            purchased_at = str(timestamp_raw or "")
+
+            config_id: int | None = None
+            match = re.search(r"config_id=(\d+)", description)
+            if match:
+                config_id = int(match.group(1))
+
+            title = "سرویس"
+            category = "نامشخص"
+            model = ""
+            duration = "نامشخص"
+            config_content = ""
+            price = amount
+
+            if config_id is not None:
+                async with db.execute(
+                    """
+                    SELECT title, category, model, duration, config_content, price
+                    FROM configs
+                    WHERE id = ?
+                    LIMIT 1
+                    """,
+                    (config_id,),
+                ) as cursor:
+                    config_row = await cursor.fetchone()
+                if config_row is not None:
+                    title = str(config_row[0] or "")
+                    category = str(config_row[1] or "")
+                    model = str(config_row[2] or "")
+                    duration = str(config_row[3] or "نامشخص")
+                    config_content = str(config_row[4] or "")
+                    price = int(config_row[5] or amount)
+                else:
+                    title = f"سرویس #{config_id}"
+
+            if not title:
+                title = category or "سرویس"
+            if not category:
+                category = "نامشخص"
+            if not duration:
+                duration = "نامشخص"
+
+            async with db.execute(
+                """
+                SELECT 1
+                FROM user_services
+                WHERE user_id = ?
+                  AND COALESCE(config_id, -1) = COALESCE(?, -1)
+                  AND purchased_at = ?
+                  AND config_content = ?
+                LIMIT 1
+                """,
+                (user_id, config_id, purchased_at, config_content),
+            ) as cursor:
+                exists = await cursor.fetchone()
+            if exists:
+                continue
+
+            await self.add_user_service_record(
+                db=db,
+                user_id=user_id,
+                config_id=config_id,
+                title=title,
+                category=category,
+                model=model,
+                price=price,
+                duration=duration,
+                config_content=config_content,
+                purchased_at=purchased_at,
+            )
+
+        async with db.execute(
+            """
+            SELECT
+                sold_to, id, title, category, model, price, duration, config_content,
+                COALESCE(sold_at, datetime('now'))
+            FROM configs
+            WHERE sold_to IS NOT NULL
+            ORDER BY sold_at, id
+            """
+        ) as cursor:
+            legacy_rows = await cursor.fetchall()
+
+        for row in legacy_rows:
+            user_id = int(row[0])
+            config_id = int(row[1])
+            title = str(row[2] or row[3] or "سرویس")
+            category = str(row[3] or "نامشخص")
+            model = str(row[4] or "")
+            price = int(row[5] or 0)
+            duration = str(row[6] or "نامشخص")
+            config_content = str(row[7] or "")
+            purchased_at = str(row[8] or "")
+
+            async with db.execute(
+                """
+                SELECT 1
+                FROM user_services
+                WHERE user_id = ?
+                  AND COALESCE(config_id, -1) = COALESCE(?, -1)
+                  AND purchased_at = ?
+                  AND config_content = ?
+                LIMIT 1
+                """,
+                (user_id, config_id, purchased_at, config_content),
+            ) as cursor:
+                exists = await cursor.fetchone()
+            if exists:
+                continue
+
+            await self.add_user_service_record(
+                db=db,
+                user_id=user_id,
+                config_id=config_id,
+                title=title,
+                category=category,
+                model=model,
+                price=price,
+                duration=duration,
+                config_content=config_content,
+                purchased_at=purchased_at,
+            )
+
+        await self._set_migration_meta(db, "user_services_backfilled_v1", "1")
+
     async def initialize(self, dry_run: bool = False):
         if dry_run:
             return await self._dry_run_report()
@@ -429,6 +591,24 @@ class DatabaseHandler:
             )
             await db.execute(
                 """
+                CREATE TABLE IF NOT EXISTS user_services (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    config_id INTEGER,
+                    title TEXT,
+                    category TEXT,
+                    model TEXT,
+                    price INTEGER DEFAULT 0,
+                    duration TEXT DEFAULT 'نامشخص',
+                    config_content TEXT NOT NULL,
+                    purchased_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE,
+                    FOREIGN KEY(config_id) REFERENCES configs(id) ON DELETE SET NULL
+                )
+                """
+            )
+            await db.execute(
+                """
                 CREATE TABLE IF NOT EXISTS config_items (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     config_id INTEGER NOT NULL,
@@ -437,6 +617,12 @@ class DatabaseHandler:
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY(config_id) REFERENCES configs(id) ON DELETE CASCADE
                 )
+                """
+            )
+            await db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_user_services_user_time
+                ON user_services(user_id, purchased_at DESC, id DESC)
                 """
             )
             await db.execute(
@@ -637,6 +823,7 @@ class DatabaseHandler:
             )
 
             await self._run_fk_v2_zero_loss_migration(db)
+            await self._backfill_user_services_from_transactions(db)
 
             await db.commit()
 
@@ -1119,10 +1306,10 @@ class DatabaseHandler:
                 update_cursor = await db.execute(
                     """
                     UPDATE configs
-                    SET is_sold = 1, sold_to = ?, sold_at = datetime('now')
+                    SET is_sold = 1, sold_at = datetime('now')
                     WHERE id = ? AND is_sold = 0
                     """,
-                    (user_id, config_id),
+                    (config_id,),
                 )
                 if update_cursor.rowcount != 1:
                     await db.rollback()
@@ -1134,6 +1321,33 @@ class DatabaseHandler:
                     VALUES (?, ?, 'purchase', ?, datetime('now'))
                     """,
                     (user_id, price, f"purchase config_id={config_id}"),
+                )
+                async with db.execute(
+                    """
+                    SELECT title, category, model, duration, config_content
+                    FROM configs
+                    WHERE id = ?
+                    LIMIT 1
+                    """,
+                    (config_id,),
+                ) as cursor:
+                    service_meta_row = await cursor.fetchone()
+
+                service_title = str(service_meta_row[0] or "") if service_meta_row else ""
+                service_category = str(service_meta_row[1] or "") if service_meta_row else ""
+                service_model = str(service_meta_row[2] or "") if service_meta_row else ""
+                service_duration = str(service_meta_row[3] or "نامشخص") if service_meta_row else "نامشخص"
+                service_config_content = str(service_meta_row[4] or "") if service_meta_row else ""
+                await self.add_user_service_record(
+                    db=db,
+                    user_id=user_id,
+                    config_id=config_id,
+                    title=service_title,
+                    category=service_category,
+                    model=service_model,
+                    price=price,
+                    duration=service_duration,
+                    config_content=service_config_content,
                 )
 
                 await db.commit()
@@ -1154,27 +1368,91 @@ class DatabaseHandler:
             )
             await db.commit()
 
+    async def add_user_service_record(
+        self,
+        *,
+        db,
+        user_id: int,
+        config_id: int | None,
+        title: str,
+        category: str,
+        model: str,
+        price: int,
+        duration: str,
+        config_content: str,
+        purchased_at: str | None = None,
+    ) -> None:
+        if purchased_at:
+            await db.execute(
+                """
+                INSERT INTO user_services (
+                    user_id, config_id, title, category, model, price, duration, config_content, purchased_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    user_id,
+                    config_id,
+                    title,
+                    category,
+                    model,
+                    price,
+                    duration,
+                    config_content,
+                    purchased_at,
+                ),
+            )
+            return
+
+        await db.execute(
+            """
+            INSERT INTO user_services (
+                user_id, config_id, title, category, model, price, duration, config_content, purchased_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            """,
+            (
+                user_id,
+                config_id,
+                title,
+                category,
+                model,
+                price,
+                duration,
+                config_content,
+            ),
+        )
+
     async def get_user_purchases(self, user_id: int) -> list[tuple[int, str, str, str]]:
         async with self._connect() as db:
             async with db.execute(
                 """
-                SELECT id, category, config_content, COALESCE(sold_at, datetime('now'))
-                FROM configs
-                WHERE sold_to = ?
-                ORDER BY sold_at DESC, id DESC
+                SELECT config_id, category, config_content, purchased_at
+                FROM user_services
+                WHERE user_id = ?
+                ORDER BY purchased_at DESC, id DESC
                 """,
                 (user_id,),
             ) as cursor:
-                return await cursor.fetchall()
+                rows = await cursor.fetchall()
+                return [
+                    (
+                        int(row[0]) if row[0] is not None else 0,
+                        str(row[1] or ""),
+                        str(row[2] or ""),
+                        str(row[3] or ""),
+                    )
+                    for row in rows
+                ]
 
     async def get_user_services(self, user_id: int) -> list[dict[str, object]]:
         async with self._connect() as db:
             async with db.execute(
                 """
-                SELECT id, title, category, config_content, duration, sold_at
-                FROM configs
-                WHERE sold_to = ?
-                ORDER BY sold_at DESC, id DESC
+                SELECT config_id, title, category, model, price, duration, config_content, purchased_at
+                FROM user_services
+                WHERE user_id = ?
+                ORDER BY purchased_at DESC, id DESC
                 """,
                 (user_id,),
             ) as cursor:
@@ -1183,11 +1461,14 @@ class DatabaseHandler:
         now = datetime.now(timezone.utc)
         services: list[dict[str, object]] = []
         for row in rows:
-            config_id = int(row[0])
+            config_id = int(row[0]) if row[0] is not None else 0
             title = str(row[1] or row[2] or "سرویس")
-            config_content = str(row[3] or "")
-            duration_text = str(row[4] or "")
-            sold_at_text = str(row[5] or "")
+            category = str(row[2] or "")
+            model = str(row[3] or "")
+            price = int(row[4] or 0)
+            duration_text = str(row[5] or "")
+            config_content = str(row[6] or "")
+            sold_at_text = str(row[7] or "")
 
             expires_at = "نامشخص"
             days = self._extract_duration_days(duration_text)
@@ -1209,8 +1490,12 @@ class DatabaseHandler:
                 {
                     "id": config_id,
                     "name": title,
+                    "category": category,
+                    "model": model,
+                    "price": price,
                     "config_link": config_content,
                     "expires_at": expires_at,
+                    "purchased_at": sold_at_text,
                 }
             )
         return services
@@ -1320,24 +1605,23 @@ class DatabaseHandler:
 
     async def get_user_purchase_history(self, user_id: int, limit: int = 5) -> list[tuple[str, str]]:
         async with self._connect() as db:
-            # This project stores purchase ownership on configs (sold_to), so we read history from there.
             async with db.execute(
                 """
-                SELECT cat.name, cfg.config_content
-                FROM configs cfg
-                LEFT JOIN categories cat ON cat.name = cfg.category
-                WHERE cfg.sold_to = ?
-                ORDER BY cfg.sold_at DESC, cfg.id DESC
+                SELECT category, config_content
+                FROM user_services
+                WHERE user_id = ?
+                ORDER BY purchased_at DESC, id DESC
                 LIMIT ?
                 """,
                 (user_id, limit),
             ) as cursor:
-                return await cursor.fetchall()
+                rows = await cursor.fetchall()
+                return [(str(row[0] or ""), str(row[1] or "")) for row in rows]
 
     async def get_user_purchases_count(self, user_id: int) -> int:
         async with self._connect() as db:
             async with db.execute(
-                "SELECT COUNT(*) FROM configs WHERE sold_to = ?",
+                "SELECT COUNT(*) FROM user_services WHERE user_id = ?",
                 (user_id,),
             ) as cursor:
                 row = await cursor.fetchone()
@@ -1567,7 +1851,6 @@ class DatabaseHandler:
                             WHEN stock > 1 THEN 0
                             ELSE 1
                         END,
-                        sold_to = ?,
                         sold_at = datetime('now'),
                         stock = CASE
                             WHEN stock = -1 THEN -1
@@ -1576,7 +1859,7 @@ class DatabaseHandler:
                         END
                     WHERE id = ? AND is_sold = 0 AND is_active = 1
                     """,
-                    (user_id, config_id),
+                    (config_id,),
                 )
                 if update_cursor.rowcount != 1:
                     await db.rollback()
@@ -1588,6 +1871,32 @@ class DatabaseHandler:
                     VALUES (?, ?, 'purchase', ?, datetime('now'))
                     """,
                     (user_id, price, f"purchase config_id={config_id}"),
+                )
+                async with db.execute(
+                    """
+                    SELECT title, category, model, duration
+                    FROM configs
+                    WHERE id = ?
+                    LIMIT 1
+                    """,
+                    (config_id,),
+                ) as cursor:
+                    service_meta_row = await cursor.fetchone()
+
+                service_title = str(service_meta_row[0] or "") if service_meta_row else ""
+                service_category = str(service_meta_row[1] or "") if service_meta_row else ""
+                service_model = str(service_meta_row[2] or "") if service_meta_row else ""
+                service_duration = str(service_meta_row[3] or "نامشخص") if service_meta_row else "نامشخص"
+                await self.add_user_service_record(
+                    db=db,
+                    user_id=user_id,
+                    config_id=config_id,
+                    title=service_title,
+                    category=service_category,
+                    model=service_model,
+                    price=price,
+                    duration=service_duration,
+                    config_content=config_content,
                 )
 
                 await db.commit()

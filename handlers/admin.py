@@ -20,7 +20,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 from config import settings
 from database.db_handler import DatabaseHandler
 from keyboards.admin_menu import build_admin_menu
-from keyboards.start_menu import build_start_menu
+from handlers.main_menu_renderer import render_main_menu
 from utils.states import AdminServiceStates, AdminStates
 from utils.security import parse_int_callback_payload, rate_limiter
 
@@ -483,7 +483,7 @@ async def admin_services_root_handler(message: Message, state: FSMContext) -> No
 async def admin_exit_panel_handler(message: Message, state: FSMContext) -> None:
     await state.clear()
     await message.answer("🏠 شما از پنل مدیریت خارج شدید.", reply_markup=ReplyKeyboardRemove())
-    await message.answer("منوی اصلی:", reply_markup=build_start_menu())
+    await render_main_menu(message)
 
 
 @router.callback_query(F.data == "admin_services_root")
